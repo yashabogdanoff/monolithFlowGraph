@@ -207,6 +207,11 @@
 			"LoadingPhase": "Default"
 		},
 		{
+			"Name": "MonolithFlow",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
 			"Name": "MonolithAudio",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
