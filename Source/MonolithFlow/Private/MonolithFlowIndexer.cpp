@@ -149,7 +149,8 @@ namespace
 		const FString& FromNodeGuid,
 		const FString& FromPin,
 		const FString& ToNodeGuid,
-		const FString& ToPin)
+		const FString& ToPin,
+		bool bIsOrphaned = false)
 	{
 		Stmt.Reset();
 		Stmt.ClearBindings();
@@ -158,6 +159,7 @@ namespace
 		Stmt.SetBindingValueByIndex(3, FromPin);
 		Stmt.SetBindingValueByIndex(4, ToNodeGuid);
 		Stmt.SetBindingValueByIndex(5, ToPin);
+		Stmt.SetBindingValueByIndex(6, bIsOrphaned ? 1 : 0);
 		Stmt.Execute();
 	}
 
@@ -330,8 +332,8 @@ namespace
 		if (!Stmt.Create(*RawDB, TEXT(
 			"INSERT INTO flow_node_pins ("
 			"fa_asset_id, node_guid, pin_direction, pin_index, pin_name, pin_friendly_name, "
-			"pin_type_name, pin_subcategory_object, container_type, tooltip"
-			") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")))
+			"pin_type_name, pin_subcategory_object, container_type, tooltip, is_orphaned"
+			") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)")))
 		{
 			return;
 		}
@@ -366,6 +368,24 @@ namespace
 		}
 
 		Stmt.Destroy();
+	}
+
+	/** Insert one orphan output pin row (pin name from Connections map that isn't in current OutputPins). */
+	void InsertOrphanOutputPin(
+		FSQLitePreparedStatement& Stmt,
+		int64 FaAssetId,
+		const FString& NodeGuid,
+		int32 PinIdx,
+		const FName& PinName)
+	{
+		Stmt.Reset();
+		Stmt.ClearBindings();
+		Stmt.SetBindingValueByIndex(1, FaAssetId);
+		Stmt.SetBindingValueByIndex(2, NodeGuid);
+		Stmt.SetBindingValueByIndex(3, FString(TEXT("output")));
+		Stmt.SetBindingValueByIndex(4, PinIdx);
+		Stmt.SetBindingValueByIndex(5, PinName.ToString());
+		Stmt.Execute();
 	}
 }
 
@@ -437,12 +457,15 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 		"  pin_type_name TEXT NOT NULL,"
 		"  pin_subcategory_object TEXT,"
 		"  container_type TEXT NOT NULL DEFAULT 'None',"
-		"  tooltip TEXT"
+		"  tooltip TEXT,"
+		"  is_orphaned INTEGER NOT NULL DEFAULT 0"
 		")"
 	));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_pins_fa ON flow_node_pins(fa_asset_id)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_pins_node ON flow_node_pins(node_guid)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_pins_type ON flow_node_pins(pin_type_name)"));
+	// Migrate existing tables (silently no-ops on fresh DB where column already exists).
+	RawDB->Execute(TEXT("ALTER TABLE flow_node_pins ADD COLUMN is_orphaned INTEGER NOT NULL DEFAULT 0"));
 
 	RawDB->Execute(TEXT(
 		"CREATE TABLE IF NOT EXISTS flow_node_addons ("
@@ -467,12 +490,15 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 		"  from_node_guid TEXT NOT NULL,"
 		"  from_pin TEXT NOT NULL,"
 		"  to_node_guid TEXT NOT NULL,"
-		"  to_pin TEXT NOT NULL"
+		"  to_pin TEXT NOT NULL,"
+		"  is_orphaned INTEGER NOT NULL DEFAULT 0"
 		")"
 	));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_fa ON flow_node_connections(fa_asset_id)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_from ON flow_node_connections(from_node_guid)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_to ON flow_node_connections(to_node_guid)"));
+	// Migrate existing tables (silently no-ops on fresh DB).
+	RawDB->Execute(TEXT("ALTER TABLE flow_node_connections ADD COLUMN is_orphaned INTEGER NOT NULL DEFAULT 0"));
 
 	RawDB->Execute(TEXT(
 		"CREATE TABLE IF NOT EXISTS flow_subgraph_refs ("
@@ -772,8 +798,12 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		// per-pin GetConnection(FName) is public. Walk output pins, query
 		// each. Connections are stored on the source side of an edge per
 		// the FlowNode.h comment, so this catches every edge originating here.
+		TSet<FName> CurrentOutPinNames;
+		CurrentOutPinNames.Reserve(OutPins.Num());
 		for (const FFlowPin& OutPin : OutPins)
 		{
+			CurrentOutPinNames.Add(OutPin.PinName);
+
 			const FConnectedPin Connected = Node->GetConnection(OutPin.PinName);
 			if (!Connected.NodeGuid.IsValid()) continue;
 
@@ -781,7 +811,53 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 				NodeGuidStr,
 				OutPin.PinName.ToString(),
 				Connected.NodeGuid.ToString(EGuidFormats::DigitsWithHyphens),
-				Connected.PinName.ToString());
+				Connected.PinName.ToString(),
+				/*bIsOrphaned=*/false);
+		}
+
+		// Orphan output pins — entries in the Connections map whose key isn't a current OutputPin.
+		// These are stale edges left over from previous versions of the node's pin set
+		// (e.g. SwitchOnScenario keeps per-scenario output pins even after a scenario was removed,
+		// flagged as bOrphanedPin=True in the editor wrapper). Read Connections via FMapProperty
+		// reflection (it's protected, no public accessor for the whole map).
+		if (FMapProperty* ConnectionsProp = CastField<FMapProperty>(
+				Node->GetClass()->FindPropertyByName(TEXT("Connections"))))
+		{
+			void* MapAddr = ConnectionsProp->ContainerPtrToValuePtr<void>(Node);
+			FScriptMapHelper Helper(ConnectionsProp, MapAddr);
+
+			FSQLitePreparedStatement OrphanPinStmt;
+			const bool bOrphanStmtOk = OrphanPinStmt.Create(*RawDB, TEXT(
+				"INSERT INTO flow_node_pins ("
+				"fa_asset_id, node_guid, pin_direction, pin_index, pin_name, "
+				"pin_type_name, container_type, is_orphaned"
+				") VALUES (?, ?, ?, ?, ?, 'Exec', 'None', 1)"));
+
+			int32 OrphanIdx = OutPins.Num();
+			for (int32 i = 0; i < Helper.GetMaxIndex(); ++i)
+			{
+				if (!Helper.IsValidIndex(i)) continue;
+				const FName* PinNamePtr = reinterpret_cast<const FName*>(Helper.GetKeyPtr(i));
+				const FConnectedPin* ConnectedPtr = reinterpret_cast<const FConnectedPin*>(Helper.GetValuePtr(i));
+				if (!PinNamePtr || !ConnectedPtr) continue;
+				if (CurrentOutPinNames.Contains(*PinNamePtr)) continue;
+				if (!ConnectedPtr->NodeGuid.IsValid()) continue;
+
+				if (bOrphanStmtOk)
+				{
+					InsertOrphanOutputPin(OrphanPinStmt, AssetId, NodeGuidStr, OrphanIdx, *PinNamePtr);
+				}
+
+				InsertConnection(ConnStmt, AssetId,
+					NodeGuidStr,
+					PinNamePtr->ToString(),
+					ConnectedPtr->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens),
+					ConnectedPtr->PinName.ToString(),
+					/*bIsOrphaned=*/true);
+
+				++OrphanIdx;
+			}
+			if (bOrphanStmtOk) OrphanPinStmt.Destroy();
 		}
 
 		// SubGraph reference — Asset / AssetParams are private UPROPERTYs

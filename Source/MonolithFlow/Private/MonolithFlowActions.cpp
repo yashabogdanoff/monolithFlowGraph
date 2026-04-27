@@ -510,7 +510,7 @@ namespace
 		FSQLitePreparedStatement Stmt;
 		if (!Stmt.Create(*RawDB, TEXT(
 			"SELECT pin_direction, pin_index, pin_name, pin_friendly_name, "
-			"pin_type_name, pin_subcategory_object, container_type, tooltip "
+			"pin_type_name, pin_subcategory_object, container_type, tooltip, is_orphaned "
 			"FROM flow_node_pins WHERE fa_asset_id = ? AND node_guid = ? "
 			"ORDER BY pin_direction, pin_index")))
 		{
@@ -521,7 +521,7 @@ namespace
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			FString Dir, PinName, Friendly, TypeName, SubCat, Container, Tooltip;
-			int64 PinIdx = 0;
+			int64 PinIdx = 0, Orphan = 0;
 			Stmt.GetColumnValueByIndex(0, Dir);
 			Stmt.GetColumnValueByIndex(1, PinIdx);
 			Stmt.GetColumnValueByIndex(2, PinName);
@@ -530,6 +530,7 @@ namespace
 			Stmt.GetColumnValueByIndex(5, SubCat);
 			Stmt.GetColumnValueByIndex(6, Container);
 			Stmt.GetColumnValueByIndex(7, Tooltip);
+			Stmt.GetColumnValueByIndex(8, Orphan);
 
 			auto Row = MakeShared<FJsonObject>();
 			Row->SetStringField(TEXT("pin_direction"), Dir);
@@ -540,6 +541,7 @@ namespace
 			if (!SubCat.IsEmpty()) Row->SetStringField(TEXT("pin_subcategory_object"), SubCat);
 			Row->SetStringField(TEXT("container_type"), Container);
 			if (!Tooltip.IsEmpty()) Row->SetStringField(TEXT("tooltip"), Tooltip);
+			if (Orphan != 0) Row->SetBoolField(TEXT("is_orphaned"), true);
 			Out.Add(MakeShared<FJsonValueObject>(Row));
 		}
 		Stmt.Destroy();
@@ -552,7 +554,7 @@ namespace
 		TArray<TSharedPtr<FJsonValue>> Out;
 		FSQLitePreparedStatement Stmt;
 		if (!Stmt.Create(*RawDB, TEXT(
-			"SELECT from_pin, to_node_guid, to_pin "
+			"SELECT from_pin, to_node_guid, to_pin, is_orphaned "
 			"FROM flow_node_connections WHERE fa_asset_id = ? AND from_node_guid = ? "
 			"ORDER BY from_pin, to_node_guid")))
 		{
@@ -563,14 +565,17 @@ namespace
 		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 		{
 			FString FromPin, ToGuid, ToPin;
+			int64 Orphan = 0;
 			Stmt.GetColumnValueByIndex(0, FromPin);
 			Stmt.GetColumnValueByIndex(1, ToGuid);
 			Stmt.GetColumnValueByIndex(2, ToPin);
+			Stmt.GetColumnValueByIndex(3, Orphan);
 
 			auto Row = MakeShared<FJsonObject>();
 			Row->SetStringField(TEXT("from_pin"), FromPin);
 			Row->SetStringField(TEXT("to_node_guid"), ToGuid);
 			Row->SetStringField(TEXT("to_pin"), ToPin);
+			if (Orphan != 0) Row->SetBoolField(TEXT("is_orphaned"), true);
 			Out.Add(MakeShared<FJsonValueObject>(Row));
 		}
 		Stmt.Destroy();
@@ -703,7 +708,7 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 
 	FString SQL = TEXT(
 		"SELECT node_guid, pin_direction, pin_index, pin_name, pin_friendly_name, "
-		"pin_type_name, pin_subcategory_object, container_type, tooltip "
+		"pin_type_name, pin_subcategory_object, container_type, tooltip, is_orphaned "
 		"FROM flow_node_pins WHERE fa_asset_id = ?");
 	int32 NextBind = 2;
 	if (!NodeGuid.IsEmpty())
@@ -731,10 +736,11 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 	if (!PinTypeName.IsEmpty()) Stmt.SetBindingValueByIndex(NextBind++, PinTypeName);
 
 	TArray<TSharedPtr<FJsonValue>> Rows;
+	int32 OrphanCount = 0;
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		FString Guid, Dir, PinName, FriendlyName, TypeName, SubCat, Container, Tooltip;
-		int64 PinIdx = 0;
+		int64 PinIdx = 0, Orphan = 0;
 		Stmt.GetColumnValueByIndex(0, Guid);
 		Stmt.GetColumnValueByIndex(1, Dir);
 		Stmt.GetColumnValueByIndex(2, PinIdx);
@@ -744,6 +750,7 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 		Stmt.GetColumnValueByIndex(6, SubCat);
 		Stmt.GetColumnValueByIndex(7, Container);
 		Stmt.GetColumnValueByIndex(8, Tooltip);
+		Stmt.GetColumnValueByIndex(9, Orphan);
 
 		auto Row = MakeShared<FJsonObject>();
 		Row->SetStringField(TEXT("node_guid"), Guid);
@@ -755,6 +762,7 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 		if (!SubCat.IsEmpty()) Row->SetStringField(TEXT("pin_subcategory_object"), SubCat);
 		Row->SetStringField(TEXT("container_type"), Container);
 		if (!Tooltip.IsEmpty()) Row->SetStringField(TEXT("tooltip"), Tooltip);
+		if (Orphan != 0) { Row->SetBoolField(TEXT("is_orphaned"), true); ++OrphanCount; }
 		Rows.Add(MakeShared<FJsonValueObject>(Row));
 	}
 	Stmt.Destroy();
@@ -763,6 +771,7 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 	Result->SetStringField(TEXT("fa_path"), AssetPath);
 	Result->SetArrayField(TEXT("pins"), Rows);
 	Result->SetNumberField(TEXT("count"), Rows.Num());
+	if (OrphanCount > 0) Result->SetNumberField(TEXT("orphan_count"), OrphanCount);
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -791,7 +800,7 @@ FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJs
 	Params->TryGetStringField(TEXT("to_node_guid"), ToGuid);
 
 	FString SQL = TEXT(
-		"SELECT from_node_guid, from_pin, to_node_guid, to_pin "
+		"SELECT from_node_guid, from_pin, to_node_guid, to_pin, is_orphaned "
 		"FROM flow_node_connections WHERE fa_asset_id = ?");
 	int32 NextBind = 2;
 	if (!FromGuid.IsEmpty()) SQL += TEXT(" AND from_node_guid = ?");
@@ -808,19 +817,23 @@ FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJs
 	if (!ToGuid.IsEmpty())   Stmt.SetBindingValueByIndex(NextBind++, ToGuid);
 
 	TArray<TSharedPtr<FJsonValue>> Rows;
+	int32 OrphanCount = 0;
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		FString FromG, FromP, ToG, ToP;
+		int64 Orphan = 0;
 		Stmt.GetColumnValueByIndex(0, FromG);
 		Stmt.GetColumnValueByIndex(1, FromP);
 		Stmt.GetColumnValueByIndex(2, ToG);
 		Stmt.GetColumnValueByIndex(3, ToP);
+		Stmt.GetColumnValueByIndex(4, Orphan);
 
 		auto Row = MakeShared<FJsonObject>();
 		Row->SetStringField(TEXT("from_node_guid"), FromG);
 		Row->SetStringField(TEXT("from_pin"), FromP);
 		Row->SetStringField(TEXT("to_node_guid"), ToG);
 		Row->SetStringField(TEXT("to_pin"), ToP);
+		if (Orphan != 0) { Row->SetBoolField(TEXT("is_orphaned"), true); ++OrphanCount; }
 		Rows.Add(MakeShared<FJsonValueObject>(Row));
 	}
 	Stmt.Destroy();
@@ -829,6 +842,7 @@ FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJs
 	Result->SetStringField(TEXT("fa_path"), AssetPath);
 	Result->SetArrayField(TEXT("connections"), Rows);
 	Result->SetNumberField(TEXT("count"), Rows.Num());
+	if (OrphanCount > 0) Result->SetNumberField(TEXT("orphan_count"), OrphanCount);
 	return FMonolithActionResult::Success(Result);
 }
 
@@ -1188,7 +1202,7 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 
 	FString SQL = TEXT(
 		"SELECT fa.fa_path, p.node_guid, p.pin_direction, p.pin_index, p.pin_name, "
-		"p.pin_type_name, p.pin_subcategory_object, p.container_type "
+		"p.pin_type_name, p.pin_subcategory_object, p.container_type, p.is_orphaned "
 		"FROM flow_node_pins p "
 		"JOIN flow_assets fa ON fa.fa_asset_id = p.fa_asset_id "
 		"WHERE p.pin_type_name = ?");
@@ -1219,10 +1233,11 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 
 	TMap<FString, TArray<TSharedPtr<FJsonValue>>> PinsByFa;
 	int32 TotalPins = 0;
+	int32 OrphanCount = 0;
 	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
 	{
 		FString FaPath, Guid, Dir, PinName, TypeName, SubCatRow, Container;
-		int64 PinIdx = 0;
+		int64 PinIdx = 0, Orphan = 0;
 		Stmt.GetColumnValueByIndex(0, FaPath);
 		Stmt.GetColumnValueByIndex(1, Guid);
 		Stmt.GetColumnValueByIndex(2, Dir);
@@ -1231,6 +1246,7 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 		Stmt.GetColumnValueByIndex(5, TypeName);
 		Stmt.GetColumnValueByIndex(6, SubCatRow);
 		Stmt.GetColumnValueByIndex(7, Container);
+		Stmt.GetColumnValueByIndex(8, Orphan);
 
 		auto Row = MakeShared<FJsonObject>();
 		Row->SetStringField(TEXT("node_guid"), Guid);
@@ -1240,6 +1256,7 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 		Row->SetStringField(TEXT("pin_type_name"), TypeName);
 		if (!SubCatRow.IsEmpty()) Row->SetStringField(TEXT("pin_subcategory_object"), SubCatRow);
 		Row->SetStringField(TEXT("container_type"), Container);
+		if (Orphan != 0) { Row->SetBoolField(TEXT("is_orphaned"), true); ++OrphanCount; }
 
 		PinsByFa.FindOrAdd(FaPath).Add(MakeShared<FJsonValueObject>(Row));
 		++TotalPins;
@@ -1262,6 +1279,7 @@ FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJso
 	Result->SetArrayField(TEXT("hosts"), Hosts);
 	Result->SetNumberField(TEXT("host_count"), Hosts.Num());
 	Result->SetNumberField(TEXT("total_pin_count"), TotalPins);
+	if (OrphanCount > 0) Result->SetNumberField(TEXT("orphan_count"), OrphanCount);
 	return FMonolithActionResult::Success(Result);
 }
 
