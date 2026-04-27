@@ -152,6 +152,7 @@ Each module has its own spec file under `specs/`. The table below is the index.
 | 3.15 | MonolithLogicDriver | [specs/SPEC_MonolithLogicDriver.md](specs/SPEC_MonolithLogicDriver.md) | Logic Driver Pro integration (66 actions, WITH_LOGICDRIVER) |
 | 3.16 | MonolithAI | [specs/SPEC_MonolithAI.md](specs/SPEC_MonolithAI.md) | Behavior Trees, Blackboards, State Trees, EQS, Smart Objects, Perception, Nav (221 actions, +2 in Phase J F8) |
 | 3.17 | MonolithAudio | [specs/SPEC_MonolithAudio.md](specs/SPEC_MonolithAudio.md) | Sound Cues, MetaSounds, batch audio ops, AI Perception bind (86 actions, MetaSound WITH_METASOUND) |
+| 3.18 | MonolithFlow | [specs/SPEC_MonolithFlow.md](specs/SPEC_MonolithFlow.md) | MothCocoon Flow plugin: read-only graph indexer, cross-asset reverse lookups, class registry (14 actions, WITH_FLOW). **Fork-only** — see spec for status block |
 
 ---
 

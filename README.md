@@ -18,7 +18,7 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (20 tools), massive capability (1274 actions across 16 in-tree namespaces; sibling plugins add their own and push the live registry higher when loaded). The AI gets oriented fast and spends its context on your actual problem.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (21 tools), massive capability (1288 actions across 17 in-tree namespaces; sibling plugins add their own and push the live registry higher when loaded). The AI gets oriented fast and spends its context on your actual problem.
 
 ## What Can It Actually Do?
 
@@ -224,7 +224,7 @@ Different AI coding assistants use different conventions for project-instruction
 
 Practical prompt to feed your assistant once Monolith is installed and running:
 
-> *"I've installed the Monolith Unreal plugin. It exposes ~1274 actions across 16 namespaces (`blueprint`, `material`, `animation`, `niagara`, `mesh`, `ui`, `gas`, `ai`, `audio`, etc.) over an in-process MCP HTTP listener at `http://localhost:9316/mcp`. What's the best-practice format for a project-instructions file for [your assistant — e.g. `CLAUDE.md`, `AGENTS.md`, `.cursorrules`]? It should help with action discovery via `monolith_discover()`, asset-path conventions like `/Game/Path/Asset`, and verifying UE 5.7 APIs via `source_query` before writing code."*
+> *"I've installed the Monolith Unreal plugin. It exposes ~1288 actions across 17 namespaces (`blueprint`, `material`, `animation`, `niagara`, `mesh`, `ui`, `gas`, `ai`, `audio`, `flow`, etc.) over an in-process MCP HTTP listener at `http://localhost:9316/mcp`. What's the best-practice format for a project-instructions file for [your assistant — e.g. `CLAUDE.md`, `AGENTS.md`, `.cursorrules`]? It should help with action discovery via `monolith_discover()`, asset-path conventions like `/Game/Path/Asset`, and verifying UE 5.7 APIs via `source_query` before writing code."*
 
 Whatever your AI generates, drop it at the appropriate path for your toolchain. The action counts and workflow notes from this README's earlier sections are usable input.
 
@@ -279,6 +279,7 @@ Monolith.uplugin
   MonolithUI            — UI widget Blueprint CRUD, templates, styling, animation v1+v2, EffectSurface, Spec Builder, Type Registry, CommonUI (121 actions: 66 always-on + 51 CommonUI + 4 GAS aliases)
   MonolithGAS           — Gameplay Ability System: abilities, effects, attributes, ASC, tags, cues, targeting, ULeviathanVitalsSet template (135 actions)
   MonolithLogicDriver   — Logic Driver Pro state machines: SM CRUD, graph read/write, JSON spec, scaffolding (66 actions)
+  MonolithFlow          — MothCocoon Flow plugin: read-only graph indexer, cross-asset reverse lookups, class registry (14 actions, fork-only)
   MonolithComboGraph    — ComboGraph combo trees: graph CRUD, nodes, edges, effects, cues (13 actions)
   MonolithAudio         — Audio asset CRUD, Sound Cue + MetaSound graph building, batch ops, templates, AI perception binding, sine test wave (86 actions)
   MonolithAudioRuntime  — Runtime sub-module supplying perception classes for audio.bind_sound_to_perception (0 MCP actions)
@@ -290,7 +291,9 @@ Standalone Tools (in Binaries/)
   monolith_query.exe    — Offline DB query tool (zero UE dependency, sqlite3 amalgamation)
 ```
 
-**1274 actions across 16 in-tree namespaces, exposed through 20 MCP tools (16 namespace dispatchers + 4 `monolith_*` meta-tools). Distinct handlers: 1270 — the `ui` namespace double-counts 4 aliased GAS attribute-binding actions. 45 town-gen experimental actions are disabled by default (`bEnableProceduralTownGen=false`); enabling them brings the in-tree registry to 1319.** Live editors with sibling plugins loaded report higher counts (sibling plugins are documented in their own repos).
+**1288 actions across 17 in-tree namespaces, exposed through 21 MCP tools (17 namespace dispatchers + 4 `monolith_*` meta-tools). Distinct handlers: 1284 — the `ui` namespace double-counts 4 aliased GAS attribute-binding actions. 45 town-gen experimental actions are disabled by default (`bEnableProceduralTownGen=false`); enabling them brings the in-tree registry to 1333.** Live editors with sibling plugins loaded report higher counts (sibling plugins are documented in their own repos).
+
+> **Fork note:** `MonolithFlow` (14 actions, `flow` namespace) is downstream-only in `feature/flow-graph-handler` of `yashabogdanoff/monolithFlowGraph`. Upstream Monolith totals are 14 actions / 1 namespace / 1 tool lower.
 
 ### Tool Reference
 
@@ -308,6 +311,7 @@ Standalone Tools (in Binaries/)
 | `ai` | `ai_query` | 221 | BT, BB, State Trees, EQS, Smart Objects, Controllers, Perception, Navigation, runtime debugging, scaffolding. Conditional on `WITH_STATETREE` + `WITH_SMARTOBJECTS` |
 | `gas` | `gas_query` | 135 | Gameplay Ability System — abilities, effects, attributes (incl. `ULeviathanVitalsSet`), ASC, tags, cues, targeting, input, inspect, scaffold. Conditional on `WITH_GBA` for Blueprint AttributeSets |
 | `logicdriver` | `logicdriver_query` | 66 | Logic Driver Pro state machines — SM CRUD, graph read/write, JSON spec, scaffolding, components. Conditional on `WITH_LOGICDRIVER` |
+| `flow` | `flow_query` | 14 | MothCocoon Flow plugin — read-only graph indexer, cross-asset reverse lookups (subgraph callers, node-class usages, pin-type, property substring), class registry. Conditional on `WITH_FLOW`. **Fork-only** |
 | `combograph` | `combograph_query` | 13 | ComboGraph combo trees — graph CRUD, nodes, edges, effects, cues, ability scaffolding. Conditional on `WITH_COMBOGRAPH` |
 | `audio` | `audio_query` | 86 | Sound asset CRUD, Sound Cue + MetaSound graph building, batch ops, audio health checks, templates, sine test wave, AI perception binding. MetaSound features conditional on `WITH_METASOUND` |
 | `ui` | `ui_query` | 121 (66 + 51 + 4) | UMG widget CRUD, templates, styling, animation v1+v2, EffectSurface, Spec Builder, Type Registry, settings scaffolding, accessibility. CommonUI 51 actions conditional on `WITH_COMMONUI`. 4 GAS attribute-binding aliases also live here |
@@ -451,6 +455,8 @@ Settings live at **Editor Preferences > Plugins > Monolith**:
 | Enable Procedural Town Gen | `Off` | **Work-in-progress** — 45 additional mesh actions for procedural building/town generation. Very much a WIP; unless you're willing to dig in and help improve it, best left alone for now |
 | Enable GAS | `On` | Gameplay Ability System integration (135 actions, requires GameplayAbilities plugin) |
 | Enable Logic Driver | `On` | Logic Driver Pro state machine integration (66 actions, requires Logic Driver Pro marketplace plugin) |
+| Enable Flow | `On` | MothCocoon Flow plugin integration (14 actions, requires Flow plugin; fork-only handler) |
+| Index Flow | `On` | Pull Flow asset graphs into ProjectIndex.db (8 tables, drives `flow_query` reverse lookups) |
 | Enable ComboGraph | `On` | ComboGraph combo tree integration (13 actions, requires ComboGraph marketplace plugin) |
 | Enable Blueprint Assist | `On` | Blueprint Assist integration for enhanced auto_layout (requires BA marketplace plugin) |
 
@@ -471,6 +477,7 @@ Monolith bundles 16 Claude Code skills in `Skills/` — domain-specific workflow
 | `unreal-ui` | Widget Blueprint CRUD, templates, styling, accessibility |
 | `unreal-gas` | Gameplay Ability System — abilities, effects, attributes, ASC, tags, cues |
 | `unreal-logicdriver` | Logic Driver Pro state machines — SM CRUD, graph editing, JSON spec, scaffolding |
+| `unreal-flow` | MothCocoon Flow plugin — read-only graph indexer, scenario inspection, cross-asset reverse lookups (fork-only) |
 | `unreal-combograph` | ComboGraph combo trees — graph CRUD, nodes, edges, effects, ability scaffolding |
 | `unreal-level-sequences` | Level Sequence inspection — full binding inventory (legacy + UE 5.7 custom bindings), Director Blueprint functions/variables, event-track bindings, cross-sequence reverse lookup |
 | `unreal-debugging` | Build errors, log search, crash context |
