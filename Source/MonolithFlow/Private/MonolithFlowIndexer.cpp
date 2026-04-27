@@ -10,6 +10,7 @@
 #include "Nodes/FlowPin.h"
 #include "Nodes/FlowNodeBlueprint.h"
 #include "Nodes/FlowNodeAddOnBlueprint.h"
+#include "Nodes/Graph/FlowNode_SubGraph.h"
 #include "SQLiteDatabase.h"
 #include "SQLitePreparedStatement.h"
 #include "AssetRegistry/AssetData.h"
@@ -369,6 +370,30 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_from ON flow_node_connections(from_node_guid)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_to ON flow_node_connections(to_node_guid)"));
 
+	RawDB->Execute(TEXT(
+		"CREATE TABLE IF NOT EXISTS flow_subgraph_refs ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  host_fa_asset_id INTEGER NOT NULL,"
+		"  host_fa_path TEXT NOT NULL,"
+		"  host_node_guid TEXT NOT NULL,"
+		"  target_fa_path TEXT,"
+		"  target_params_path TEXT"
+		")"
+	));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_subref_host_fa ON flow_subgraph_refs(host_fa_asset_id)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_subref_target ON flow_subgraph_refs(target_fa_path)"));
+
+	RawDB->Execute(TEXT(
+		"CREATE TABLE IF NOT EXISTS flow_custom_events ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  fa_asset_id INTEGER NOT NULL,"
+		"  kind TEXT NOT NULL,"
+		"  event_name TEXT NOT NULL"
+		")"
+	));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_evt_fa ON flow_custom_events(fa_asset_id)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_evt_name ON flow_custom_events(event_name)"));
+
 	bTablesCreated = true;
 }
 
@@ -398,6 +423,8 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), PrevAssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), PrevAssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), PrevAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id = ?"), PrevAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id = ?"), PrevAssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), PrevAssetId);
 	}
 	// Also clean by current AssetId in case PrevAssetId differs (autoincrement restart)
@@ -406,6 +433,8 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), AssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), AssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), AssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_subgraph_refs WHERE host_fa_asset_id = ?"), AssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_custom_events WHERE fa_asset_id = ?"), AssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), AssetId);
 	}
 
@@ -457,6 +486,7 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	// ----- Walk nodes -----
 	int32 NodeCount = 0;
 	int32 TotalAddonCount = 0;
+	int32 SubGraphCount = 0;
 
 	FSQLitePreparedStatement NodeStmt;
 	const bool bNodeStmtOk = NodeStmt.Create(*RawDB, TEXT(
@@ -483,12 +513,19 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		"fa_asset_id, owner_node_guid, parent_addon_id, addon_class, addon_index, depth, data"
 		") VALUES (?, ?, ?, ?, ?, ?, ?)"));
 
-	if (!bConnStmtOk || !bAddOnStmtOk)
+	FSQLitePreparedStatement SubGraphStmt;
+	const bool bSubGraphStmtOk = SubGraphStmt.Create(*RawDB, TEXT(
+		"INSERT INTO flow_subgraph_refs ("
+		"host_fa_asset_id, host_fa_path, host_node_guid, target_fa_path, target_params_path"
+		") VALUES (?, ?, ?, ?, ?)"));
+
+	if (!bConnStmtOk || !bAddOnStmtOk || !bSubGraphStmtOk)
 	{
-		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: failed to prepare connections/addons INSERTs"));
+		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: failed to prepare connections/addons/subgraph INSERTs"));
 		NodeStmt.Destroy();
 		if (bConnStmtOk) ConnStmt.Destroy();
 		if (bAddOnStmtOk) AddOnStmt.Destroy();
+		if (bSubGraphStmtOk) SubGraphStmt.Destroy();
 		return false;
 	}
 
@@ -549,27 +586,90 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 				Connected.NodeGuid.ToString(EGuidFormats::DigitsWithHyphens),
 				Connected.PinName.ToString());
 		}
+
+		// SubGraph reference — Asset / AssetParams are private UPROPERTYs
+		// on UFlowNode_SubGraph with no public accessor; read via reflection.
+		if (UFlowNode_SubGraph* SubGraphNode = Cast<UFlowNode_SubGraph>(Node))
+		{
+			auto ReadSoftPath = [SubGraphNode](const TCHAR* PropName) -> FString
+			{
+				if (FSoftObjectProperty* Prop = CastField<FSoftObjectProperty>(
+						SubGraphNode->GetClass()->FindPropertyByName(PropName)))
+				{
+					const FSoftObjectPtr SoftPtr = Prop->GetPropertyValue_InContainer(SubGraphNode);
+					return SoftPtr.ToSoftObjectPath().ToString();
+				}
+				return FString();
+			};
+
+			const FString TargetFaPath     = ReadSoftPath(TEXT("Asset"));
+			const FString TargetParamsPath = ReadSoftPath(TEXT("AssetParams"));
+
+			SubGraphStmt.Reset();
+			SubGraphStmt.ClearBindings();
+			SubGraphStmt.SetBindingValueByIndex(1, AssetId);
+			SubGraphStmt.SetBindingValueByIndex(2, FaPath);
+			SubGraphStmt.SetBindingValueByIndex(3, NodeGuidStr);
+			BindNullableString(SubGraphStmt, 4, TargetFaPath);
+			BindNullableString(SubGraphStmt, 5, TargetParamsPath);
+			SubGraphStmt.Execute();
+			++SubGraphCount;
+		}
 	}
 
 	NodeStmt.Destroy();
 	ConnStmt.Destroy();
 	AddOnStmt.Destroy();
+	SubGraphStmt.Destroy();
+
+	// ----- Custom Inputs / Custom Outputs (runtime-safe accessors that
+	//       walk UFlowNode_CustomInput / UFlowNode_CustomOutput nodes) -----
+	{
+		FSQLitePreparedStatement EvtStmt;
+		if (EvtStmt.Create(*RawDB, TEXT(
+			"INSERT INTO flow_custom_events (fa_asset_id, kind, event_name) VALUES (?, ?, ?)")))
+		{
+			for (const FName& InputName : FA->GatherCustomInputNodeEventNames())
+			{
+				if (InputName.IsNone()) continue;
+				EvtStmt.Reset();
+				EvtStmt.ClearBindings();
+				EvtStmt.SetBindingValueByIndex(1, AssetId);
+				EvtStmt.SetBindingValueByIndex(2, FString(TEXT("input")));
+				EvtStmt.SetBindingValueByIndex(3, InputName.ToString());
+				EvtStmt.Execute();
+			}
+			for (const FName& OutputName : FA->GatherCustomOutputNodeEventNames())
+			{
+				if (OutputName.IsNone()) continue;
+				EvtStmt.Reset();
+				EvtStmt.ClearBindings();
+				EvtStmt.SetBindingValueByIndex(1, AssetId);
+				EvtStmt.SetBindingValueByIndex(2, FString(TEXT("output")));
+				EvtStmt.SetBindingValueByIndex(3, OutputName.ToString());
+				EvtStmt.Execute();
+			}
+			EvtStmt.Destroy();
+		}
+	}
 
 	// ----- Update counts on flow_assets row -----
 	{
 		FSQLitePreparedStatement Stmt;
 		if (Stmt.Create(*RawDB, TEXT(
-			"UPDATE flow_assets SET node_count = ?, addon_count = ? WHERE id = ?")))
+			"UPDATE flow_assets SET node_count = ?, addon_count = ?, subgraph_count = ? WHERE id = ?")))
 		{
 			Stmt.SetBindingValueByIndex(1, NodeCount);
 			Stmt.SetBindingValueByIndex(2, TotalAddonCount);
-			Stmt.SetBindingValueByIndex(3, FaRowId);
+			Stmt.SetBindingValueByIndex(3, SubGraphCount);
+			Stmt.SetBindingValueByIndex(4, FaRowId);
 			Stmt.Execute();
 			Stmt.Destroy();
 		}
 	}
 
-	UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: indexed %s — %d nodes, %d addons"), *FaPath, NodeCount, TotalAddonCount);
+	UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: indexed %s — %d nodes, %d addons, %d subgraph refs"),
+		*FaPath, NodeCount, TotalAddonCount, SubGraphCount);
 	return true;
 }
 

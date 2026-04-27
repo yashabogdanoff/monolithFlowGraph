@@ -39,4 +39,13 @@ public:
 
 	/** Single-node deep dive: row + parsed data + pins + connections + addon tree. */
 	static FMonolithActionResult GetNodeInfo(const TSharedPtr<FJsonObject>& Params);
+
+	/** Custom Inputs and Custom Outputs (subgraph entry/exit names) of one Flow Asset. */
+	static FMonolithActionResult ListCustomEvents(const TSharedPtr<FJsonObject>& Params);
+
+	/** Reverse: which Flow Assets reference a target Flow Asset via UFlowNode_SubGraph. */
+	static FMonolithActionResult FindSubgraphCallers(const TSharedPtr<FJsonObject>& Params);
+
+	/** Reverse: every Flow Asset using a node of the given UClass path. */
+	static FMonolithActionResult FindNodeClassUsages(const TSharedPtr<FJsonObject>& Params);
 };

@@ -152,6 +152,30 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
 			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node FGuid string (digits-with-hyphens, matches list_nodes output)"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("list_custom_events"),
+		TEXT("List Custom Inputs and Custom Outputs of one Flow Asset (the named entry/exit pins exposed to parent SubGraph nodes). Sourced from UFlowAsset::GatherCustomInputNodeEventNames / GatherCustomOutputNodeEventNames — runtime-safe, walks actual graph nodes."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListCustomEvents),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Optional(TEXT("kind"), TEXT("string"), TEXT("\"input\" | \"output\" | \"all\" (default)"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("find_subgraph_callers"),
+		TEXT("Cross-asset reverse lookup: every Flow Asset that hosts a UFlowNode_SubGraph referencing the target Flow Asset. Returns one row per call site (host_fa_path + host_node_guid + target_params_path). Optional asset_path_filter glob narrows the host search."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::FindSubgraphCallers),
+		FParamSchemaBuilder()
+			.Required(TEXT("target_asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path of the target subgraph (or its TopLevelAssetPath form for a soft reference)"))
+			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host_fa_path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("find_node_class_usages"),
+		TEXT("Cross-asset reverse lookup: every Flow Asset containing a node of the specified UClass path. Returns rows grouped by host_fa_path with per-node guids. Optional asset_path_filter glob narrows the host search."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::FindNodeClassUsages),
+		FParamSchemaBuilder()
+			.Required(TEXT("node_class"), TEXT("string"), TEXT("Exact UClass path (e.g. \"/Script/SIMULATOR.SimulatorFlowNode_Dialogue\")"))
+			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host_fa_path"))
+			.Build());
 }
 
 // ============================================================================
@@ -924,5 +948,194 @@ FMonolithActionResult FMonolithFlowActions::GetNodeInfo(const TSharedPtr<FJsonOb
 	Result->SetArrayField(TEXT("outgoing_connections"), ReadOutgoingConnections(RawDB, AssetId, NodeGuid));
 	Result->SetArrayField(TEXT("addons"), ReadAddonTreeForNode(RawDB, AssetId, NodeGuid));
 
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::ListCustomEvents(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString AssetPath;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path is required"));
+	}
+
+	int64 RowId = -1, AssetId = -1;
+	SelectFlowAssetIds(RawDB, AssetPath, RowId, AssetId);
+	if (RowId <= 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No Flow Asset indexed at path '%s'."), *AssetPath));
+	}
+
+	FString Kind;
+	Params->TryGetStringField(TEXT("kind"), Kind);
+
+	FString SQL = TEXT("SELECT kind, event_name FROM flow_custom_events WHERE fa_asset_id = ?");
+	if (!Kind.IsEmpty() && Kind != TEXT("all"))
+	{
+		SQL += TEXT(" AND kind = ?");
+	}
+	SQL += TEXT(" ORDER BY kind, event_name");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare list_custom_events SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, AssetId);
+	if (!Kind.IsEmpty() && Kind != TEXT("all"))
+	{
+		Stmt.SetBindingValueByIndex(2, Kind);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Inputs, Outputs;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString K, Name;
+		Stmt.GetColumnValueByIndex(0, K);
+		Stmt.GetColumnValueByIndex(1, Name);
+		auto Val = MakeShared<FJsonValueString>(Name);
+		if (K == TEXT("input")) Inputs.Add(Val); else Outputs.Add(Val);
+	}
+	Stmt.Destroy();
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("fa_path"), AssetPath);
+	Result->SetArrayField(TEXT("custom_inputs"), Inputs);
+	Result->SetArrayField(TEXT("custom_outputs"), Outputs);
+	Result->SetNumberField(TEXT("count"), Inputs.Num() + Outputs.Num());
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::FindSubgraphCallers(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString TargetPath;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("target_asset_path"), TargetPath) || TargetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("target_asset_path is required"));
+	}
+
+	FString PathFilter;
+	Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);
+
+	FString SQL = TEXT(
+		"SELECT host_fa_path, host_node_guid, target_params_path "
+		"FROM flow_subgraph_refs WHERE target_fa_path = ?");
+	int32 NextBind = 2;
+	if (!PathFilter.IsEmpty())
+	{
+		const FString Like = GlobToLike(PathFilter);
+		SQL += FString::Printf(TEXT(" AND host_fa_path LIKE '%s'"), *Like);
+	}
+	SQL += TEXT(" ORDER BY host_fa_path, host_node_guid");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare find_subgraph_callers SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, TargetPath);
+	(void)NextBind;
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString HostPath, HostGuid, ParamsPath;
+		Stmt.GetColumnValueByIndex(0, HostPath);
+		Stmt.GetColumnValueByIndex(1, HostGuid);
+		Stmt.GetColumnValueByIndex(2, ParamsPath);
+
+		auto Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("host_fa_path"), HostPath);
+		Row->SetStringField(TEXT("host_node_guid"), HostGuid);
+		if (!ParamsPath.IsEmpty()) Row->SetStringField(TEXT("target_params_path"), ParamsPath);
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+	Stmt.Destroy();
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("target_asset_path"), TargetPath);
+	Result->SetArrayField(TEXT("callers"), Rows);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::FindNodeClassUsages(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString NodeClass;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("node_class"), NodeClass) || NodeClass.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("node_class is required"));
+	}
+
+	FString PathFilter;
+	Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);
+
+	// Join flow_nodes with flow_assets to get host fa_path per matching node.
+	FString SQL = TEXT(
+		"SELECT fa.fa_path, n.node_guid, n.display_name "
+		"FROM flow_nodes n "
+		"JOIN flow_assets fa ON fa.fa_asset_id = n.fa_asset_id "
+		"WHERE n.node_class = ?");
+	if (!PathFilter.IsEmpty())
+	{
+		const FString Like = GlobToLike(PathFilter);
+		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s'"), *Like);
+	}
+	SQL += TEXT(" ORDER BY fa.fa_path, n.node_guid");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare find_node_class_usages SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, NodeClass);
+
+	// Group on the way out by fa_path.
+	TMap<FString, TArray<TSharedPtr<FJsonValue>>> NodesByFa;
+	int32 TotalNodes = 0;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString FaPath, Guid, Display;
+		Stmt.GetColumnValueByIndex(0, FaPath);
+		Stmt.GetColumnValueByIndex(1, Guid);
+		Stmt.GetColumnValueByIndex(2, Display);
+
+		auto NodeObj = MakeShared<FJsonObject>();
+		NodeObj->SetStringField(TEXT("node_guid"), Guid);
+		if (!Display.IsEmpty()) NodeObj->SetStringField(TEXT("display_name"), Display);
+
+		NodesByFa.FindOrAdd(FaPath).Add(MakeShared<FJsonValueObject>(NodeObj));
+		++TotalNodes;
+	}
+	Stmt.Destroy();
+
+	TArray<TSharedPtr<FJsonValue>> Hosts;
+	for (const TPair<FString, TArray<TSharedPtr<FJsonValue>>>& Pair : NodesByFa)
+	{
+		auto HostObj = MakeShared<FJsonObject>();
+		HostObj->SetStringField(TEXT("fa_path"), Pair.Key);
+		HostObj->SetArrayField(TEXT("nodes"), Pair.Value);
+		HostObj->SetNumberField(TEXT("node_count"), Pair.Value.Num());
+		Hosts.Add(MakeShared<FJsonValueObject>(HostObj));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("node_class"), NodeClass);
+	Result->SetArrayField(TEXT("hosts"), Hosts);
+	Result->SetNumberField(TEXT("host_count"), Hosts.Num());
+	Result->SetNumberField(TEXT("total_node_count"), TotalNodes);
 	return FMonolithActionResult::Success(Result);
 }
