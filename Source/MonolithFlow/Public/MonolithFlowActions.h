@@ -54,4 +54,7 @@ public:
 
 	/** Reverse: every node whose `data` JSON contains a substring (optionally scoped to a property name and/or node_class). */
 	static FMonolithActionResult FindNodesByProperty(const TSharedPtr<FJsonObject>& Params);
+
+	/** Registry of every UFlowNode / UFlowNodeAddOn class referenced by the project (BP and opportunistic native). */
+	static FMonolithActionResult ListNodeClasses(const TSharedPtr<FJsonObject>& Params);
 };

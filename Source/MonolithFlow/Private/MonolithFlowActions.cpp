@@ -196,6 +196,15 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("node_class"), TEXT("string"), TEXT("Restrict to nodes of this UClass path"))
 			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host fa_path"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("list_node_classes"),
+		TEXT("Registry of every UFlowNode / UFlowNodeAddOn UClass referenced by the project. Two sources populate it: UFlowNodeBlueprint / UFlowNodeAddOnBlueprint assets contribute full BP rows (is_native=0, with bp_path), and any native class encountered while walking a Flow Asset graph contributes an opportunistic row (is_native=1, bp_path=NULL). Lookup key is class_path so flow_nodes.node_class joins straight here. Optional kind narrows to node|addon, optional source narrows to blueprint|native, optional class_path_filter glob restricts the result."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListNodeClasses),
+		FParamSchemaBuilder()
+			.Optional(TEXT("kind"), TEXT("string"), TEXT("\"node\" | \"addon\" | \"all\" (default)"))
+			.Optional(TEXT("source"), TEXT("string"), TEXT("\"blueprint\" | \"native\" | \"all\" (default)"))
+			.Optional(TEXT("class_path_filter"), TEXT("string"), TEXT("Glob restricting class_path"))
+			.Build());
 }
 
 // ============================================================================
@@ -1357,5 +1366,92 @@ FMonolithActionResult FMonolithFlowActions::FindNodesByProperty(const TSharedPtr
 	Result->SetArrayField(TEXT("hosts"), Hosts);
 	Result->SetNumberField(TEXT("host_count"), Hosts.Num());
 	Result->SetNumberField(TEXT("total_node_count"), TotalNodes);
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::ListNodeClasses(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString Kind, Source, PathFilter;
+	if (Params.IsValid())
+	{
+		Params->TryGetStringField(TEXT("kind"), Kind);
+		Params->TryGetStringField(TEXT("source"), Source);
+		Params->TryGetStringField(TEXT("class_path_filter"), PathFilter);
+	}
+
+	FString SQL = TEXT(
+		"SELECT class_path, bp_path, kind, parent_class_path, "
+		"display_name, category, description, is_native, is_abstract "
+		"FROM flow_node_classes WHERE 1=1");
+	int32 NextBind = 1;
+	if (!Kind.IsEmpty() && Kind != TEXT("all"))
+	{
+		SQL += TEXT(" AND kind = ?");
+	}
+	if (!Source.IsEmpty() && Source != TEXT("all"))
+	{
+		if (Source == TEXT("blueprint"))      SQL += TEXT(" AND is_native = 0");
+		else if (Source == TEXT("native"))    SQL += TEXT(" AND is_native = 1");
+		else return FMonolithActionResult::Error(TEXT("source must be \"blueprint\", \"native\", or \"all\""));
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		const FString Like = GlobToLike(PathFilter);
+		SQL += FString::Printf(TEXT(" AND class_path LIKE '%s'"), *Like);
+	}
+	SQL += TEXT(" ORDER BY is_native, kind, class_path");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare list_node_classes SQL"));
+	}
+	if (!Kind.IsEmpty() && Kind != TEXT("all"))
+	{
+		Stmt.SetBindingValueByIndex(NextBind++, Kind);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	int32 NativeCount = 0;
+	int32 BpCount = 0;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString ClassPath, BpPath, K, ParentCls, Display, Category, Desc;
+		int64 IsNative = 0, IsAbstract = 0;
+		Stmt.GetColumnValueByIndex(0, ClassPath);
+		Stmt.GetColumnValueByIndex(1, BpPath);
+		Stmt.GetColumnValueByIndex(2, K);
+		Stmt.GetColumnValueByIndex(3, ParentCls);
+		Stmt.GetColumnValueByIndex(4, Display);
+		Stmt.GetColumnValueByIndex(5, Category);
+		Stmt.GetColumnValueByIndex(6, Desc);
+		Stmt.GetColumnValueByIndex(7, IsNative);
+		Stmt.GetColumnValueByIndex(8, IsAbstract);
+
+		auto Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("class_path"), ClassPath);
+		if (!BpPath.IsEmpty()) Row->SetStringField(TEXT("bp_path"), BpPath);
+		Row->SetStringField(TEXT("kind"), K);
+		if (!ParentCls.IsEmpty()) Row->SetStringField(TEXT("parent_class_path"), ParentCls);
+		if (!Display.IsEmpty()) Row->SetStringField(TEXT("display_name"), Display);
+		if (!Category.IsEmpty()) Row->SetStringField(TEXT("category"), Category);
+		if (!Desc.IsEmpty()) Row->SetStringField(TEXT("description"), Desc);
+		Row->SetBoolField(TEXT("is_native"), IsNative != 0);
+		Row->SetBoolField(TEXT("is_abstract"), IsAbstract != 0);
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+
+		if (IsNative != 0) ++NativeCount; else ++BpCount;
+	}
+	Stmt.Destroy();
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("classes"), Rows);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
+	Result->SetNumberField(TEXT("native_count"), NativeCount);
+	Result->SetNumberField(TEXT("blueprint_count"), BpCount);
 	return FMonolithActionResult::Success(Result);
 }

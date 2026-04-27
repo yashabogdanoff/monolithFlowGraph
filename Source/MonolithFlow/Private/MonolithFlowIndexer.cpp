@@ -161,6 +161,14 @@ namespace
 		Stmt.Execute();
 	}
 
+	// Forward decl — defined further down (used by WalkAndInsertAddOns for opportunistic native registry rows).
+	void TryRegisterNativeNodeClass(
+		FSQLiteDatabase* RawDB,
+		FSQLitePreparedStatement& Stmt,
+		UClass* NodeCls,
+		const FString& ClassPath,
+		const TCHAR* Kind);
+
 	/**
 	 * Recursively walk a node/addon's child AddOns, writing each into
 	 * flow_node_addons. Returns the total addon count under this owner.
@@ -174,6 +182,7 @@ namespace
 	int32 WalkAndInsertAddOns(
 		FSQLiteDatabase* RawDB,
 		FSQLitePreparedStatement& InsertStmt,
+		FSQLitePreparedStatement* NativeClassRegStmt,
 		int64 FaAssetId,
 		UFlowNodeBase* Owner,
 		const FString& OwnerNodeGuid,
@@ -206,10 +215,105 @@ namespace
 			const int64 NewRowId = RawDB->GetLastInsertRowId();
 			++Total;
 
+			// Opportunistic native-class registration. BP-defined addons are registered fully
+			// when the BP asset itself is indexed; we skip them here to avoid stale is_native=1 rows.
+			if (NativeClassRegStmt)
+			{
+				FString DummyBpPath;
+				if (!IsBlueprintNodeClass(AddOn->GetClass(), DummyBpPath))
+				{
+					TryRegisterNativeNodeClass(RawDB, *NativeClassRegStmt, AddOn->GetClass(), AddOnClassPath, TEXT("addon"));
+				}
+			}
+
 			// Recurse — addons can have child addons.
-			Total += WalkAndInsertAddOns(RawDB, InsertStmt, FaAssetId, AddOn, OwnerNodeGuid, NewRowId, Depth + 1);
+			Total += WalkAndInsertAddOns(RawDB, InsertStmt, NativeClassRegStmt, FaAssetId, AddOn, OwnerNodeGuid, NewRowId, Depth + 1);
 		}
 		return Total;
+	}
+
+	/** Read a string-typed UPROPERTY (FString or FText) by name on a class CDO; empty if missing. */
+	FString ReadStringPropertyOnCDO(UClass* Cls, const TCHAR* PropName)
+	{
+		if (!Cls) return FString();
+		UObject* CDO = Cls->GetDefaultObject(/*bCreateIfNeeded=*/false);
+		if (!CDO) return FString();
+		FProperty* Prop = Cls->FindPropertyByName(PropName);
+		if (FStrProperty* StrProp = CastField<FStrProperty>(Prop))
+		{
+			return StrProp->GetPropertyValue_InContainer(CDO);
+		}
+		if (FTextProperty* TextProp = CastField<FTextProperty>(Prop))
+		{
+			return TextProp->GetPropertyValue_InContainer(CDO).ToString();
+		}
+		return FString();
+	}
+
+	/** Extract registry metadata for a UFlowNodeBase-derived UClass (display, category, description, super, abstract flag). */
+	void GatherFlowClassMetadata(
+		UClass* Cls,
+		FString& OutDisplayName,
+		FString& OutCategory,
+		FString& OutDescription,
+		FString& OutParentClass,
+		bool& OutIsAbstract)
+	{
+		OutDisplayName.Reset();
+		OutCategory.Reset();
+		OutDescription.Reset();
+		OutParentClass.Reset();
+		OutIsAbstract = false;
+		if (!Cls) return;
+
+		OutDisplayName = Cls->GetDisplayNameText().ToString();
+		if (UClass* Super = Cls->GetSuperClass())
+		{
+			OutParentClass = Super->GetPathName();
+		}
+		OutIsAbstract = Cls->HasAnyClassFlags(CLASS_Abstract);
+
+		// UFlowNodeBase exposes Category as a CDO field on most versions; fall back to UCLASS metadata.
+		OutCategory = ReadStringPropertyOnCDO(Cls, TEXT("Category"));
+#if WITH_EDITORONLY_DATA
+		if (OutCategory.IsEmpty() && Cls->HasMetaData(TEXT("Category")))
+		{
+			OutCategory = Cls->GetMetaData(TEXT("Category"));
+		}
+#endif
+
+		OutDescription = ReadStringPropertyOnCDO(Cls, TEXT("NodeDescription"));
+#if WITH_EDITORONLY_DATA
+		if (OutDescription.IsEmpty() && Cls->HasMetaData(TEXT("ToolTip")))
+		{
+			OutDescription = Cls->GetMetaData(TEXT("ToolTip"));
+		}
+#endif
+	}
+
+	/** INSERT OR IGNORE one native node-class row into flow_node_classes (used during graph walk). */
+	void TryRegisterNativeNodeClass(
+		FSQLiteDatabase* RawDB,
+		FSQLitePreparedStatement& Stmt,
+		UClass* NodeCls,
+		const FString& ClassPath,
+		const TCHAR* Kind)
+	{
+		if (!RawDB || !NodeCls) return;
+		FString Disp, Cat, Desc, Parent;
+		bool bAbs = false;
+		GatherFlowClassMetadata(NodeCls, Disp, Cat, Desc, Parent, bAbs);
+
+		Stmt.Reset();
+		Stmt.ClearBindings();
+		Stmt.SetBindingValueByIndex(1, ClassPath);
+		Stmt.SetBindingValueByIndex(2, FString(Kind));
+		BindNullableString(Stmt, 3, Parent);
+		BindNullableString(Stmt, 4, Disp);
+		BindNullableString(Stmt, 5, Cat);
+		BindNullableString(Stmt, 6, Desc);
+		Stmt.SetBindingValueByIndex(7, bAbs ? 1 : 0);
+		Stmt.Execute();
 	}
 
 	/** Walk a pin array writing one row per pin. */
@@ -394,6 +498,29 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_evt_fa ON flow_custom_events(fa_asset_id)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_evt_name ON flow_custom_events(event_name)"));
 
+	// Registry of every UFlowNode / UFlowNodeAddOn UClass referenced by the project.
+	// Two sources populate this:
+	//   - UFlowNodeBlueprint / UFlowNodeAddOnBlueprint assets indexed via IndexAsset (full BP row, is_native=0)
+	//   - native classes encountered during a Flow Asset graph walk (INSERT OR IGNORE, is_native=1)
+	// Lookup key is class_path so flow_nodes.node_class joins straight here.
+	RawDB->Execute(TEXT(
+		"CREATE TABLE IF NOT EXISTS flow_node_classes ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  bp_asset_id INTEGER NOT NULL DEFAULT 0,"
+		"  class_path TEXT NOT NULL UNIQUE,"
+		"  bp_path TEXT,"
+		"  kind TEXT NOT NULL,"
+		"  parent_class_path TEXT,"
+		"  display_name TEXT,"
+		"  category TEXT,"
+		"  description TEXT,"
+		"  is_native INTEGER NOT NULL DEFAULT 0,"
+		"  is_abstract INTEGER NOT NULL DEFAULT 0"
+		")"
+	));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_classes_kind ON flow_node_classes(kind)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_classes_native ON flow_node_classes(is_native)"));
+
 	bTablesCreated = true;
 }
 
@@ -407,7 +534,60 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	UFlowAsset* FA = Cast<UFlowAsset>(LoadedAsset);
 	if (!FA)
 	{
-		// FlowNodeBlueprint / FlowNodeAddOnBlueprint indexing comes in Step 6.
+		// UFlowNodeBlueprint / UFlowNodeAddOnBlueprint — populate flow_node_classes (BP row).
+		UBlueprint* BP = Cast<UBlueprint>(LoadedAsset);
+		if (!BP) return true;
+
+		UClass* GeneratedClass = BP->GeneratedClass;
+		if (!GeneratedClass) return true;
+
+		const bool bIsAddOn = GeneratedClass->IsChildOf(UFlowNodeAddOn::StaticClass());
+		const bool bIsNode  = !bIsAddOn && GeneratedClass->IsChildOf(UFlowNode::StaticClass());
+		if (!bIsNode && !bIsAddOn) return true;
+		const TCHAR* KindStr = bIsAddOn ? TEXT("addon") : TEXT("node");
+
+		const FString BpPath    = BP->GetPathName();
+		const FString ClassPath = GeneratedClass->GetPathName();
+
+		FString DisplayName, Category, Description, ParentClass;
+		bool bIsAbstract = false;
+		GatherFlowClassMetadata(GeneratedClass, DisplayName, Category, Description, ParentClass, bIsAbstract);
+
+		// Refresh: drop any prior row keyed on the same class_path or bp_path.
+		{
+			FSQLitePreparedStatement Stmt;
+			if (Stmt.Create(*RawDB, TEXT("DELETE FROM flow_node_classes WHERE class_path = ? OR bp_path = ?")))
+			{
+				Stmt.SetBindingValueByIndex(1, ClassPath);
+				Stmt.SetBindingValueByIndex(2, BpPath);
+				Stmt.Execute();
+				Stmt.Destroy();
+			}
+		}
+
+		FSQLitePreparedStatement InsStmt;
+		if (!InsStmt.Create(*RawDB, TEXT(
+			"INSERT INTO flow_node_classes ("
+			"bp_asset_id, class_path, bp_path, kind, parent_class_path, "
+			"display_name, category, description, is_native, is_abstract"
+			") VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)")))
+		{
+			return true;
+		}
+		InsStmt.SetBindingValueByIndex(1, AssetId);
+		InsStmt.SetBindingValueByIndex(2, ClassPath);
+		InsStmt.SetBindingValueByIndex(3, BpPath);
+		InsStmt.SetBindingValueByIndex(4, FString(KindStr));
+		BindNullableString(InsStmt, 5, ParentClass);
+		BindNullableString(InsStmt, 6, DisplayName);
+		BindNullableString(InsStmt, 7, Category);
+		BindNullableString(InsStmt, 8, Description);
+		InsStmt.SetBindingValueByIndex(9, bIsAbstract ? 1 : 0);
+		InsStmt.Execute();
+		InsStmt.Destroy();
+
+		UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: registered Flow %s blueprint %s -> %s"),
+			KindStr, *BpPath, *ClassPath);
 		return true;
 	}
 
@@ -519,13 +699,23 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		"host_fa_asset_id, host_fa_path, host_node_guid, target_fa_path, target_params_path"
 		") VALUES (?, ?, ?, ?, ?)"));
 
-	if (!bConnStmtOk || !bAddOnStmtOk || !bSubGraphStmtOk)
+	// Opportunistic native node-class registry. INSERT OR IGNORE keeps it idempotent
+	// across re-indexing of multiple Flow Assets that share the same node classes.
+	FSQLitePreparedStatement NativeClassRegStmt;
+	const bool bNativeRegStmtOk = NativeClassRegStmt.Create(*RawDB, TEXT(
+		"INSERT OR IGNORE INTO flow_node_classes ("
+		"bp_asset_id, class_path, bp_path, kind, parent_class_path, "
+		"display_name, category, description, is_native, is_abstract"
+		") VALUES (0, ?, NULL, ?, ?, ?, ?, ?, 1, ?)"));
+
+	if (!bConnStmtOk || !bAddOnStmtOk || !bSubGraphStmtOk || !bNativeRegStmtOk)
 	{
-		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: failed to prepare connections/addons/subgraph INSERTs"));
+		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: failed to prepare connections/addons/subgraph/class-reg INSERTs"));
 		NodeStmt.Destroy();
 		if (bConnStmtOk) ConnStmt.Destroy();
 		if (bAddOnStmtOk) AddOnStmt.Destroy();
 		if (bSubGraphStmtOk) SubGraphStmt.Destroy();
+		if (bNativeRegStmtOk) NativeClassRegStmt.Destroy();
 		return false;
 	}
 
@@ -547,9 +737,16 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 
 		const FString DataJson = SerializeInstancePropertiesToJson(Node);
 
+		// Opportunistic native node-class registration (BP-defined nodes are registered fully
+		// on UFlowNodeBlueprint asset indexing — skipping them here keeps is_native correct).
+		if (!bIsBp)
+		{
+			TryRegisterNativeNodeClass(RawDB, NativeClassRegStmt, Node->GetClass(), NodeClassPath, TEXT("node"));
+		}
+
 		// Walk addons first so we know the count before inserting the node row.
 		const int32 NodeAddonCount = WalkAndInsertAddOns(
-			RawDB, AddOnStmt, AssetId, Node, NodeGuidStr,
+			RawDB, AddOnStmt, &NativeClassRegStmt, AssetId, Node, NodeGuidStr,
 			/*ParentAddonRowId=*/-1, /*Depth=*/0);
 		TotalAddonCount += NodeAddonCount;
 
@@ -621,6 +818,7 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	ConnStmt.Destroy();
 	AddOnStmt.Destroy();
 	SubGraphStmt.Destroy();
+	NativeClassRegStmt.Destroy();
 
 	// ----- Custom Inputs / Custom Outputs (runtime-safe accessors that
 	//       walk UFlowNode_CustomInput / UFlowNode_CustomOutput nodes) -----
