@@ -48,4 +48,10 @@ public:
 
 	/** Reverse: every Flow Asset using a node of the given UClass path. */
 	static FMonolithActionResult FindNodeClassUsages(const TSharedPtr<FJsonObject>& Params);
+
+	/** Reverse: every pin in the index matching a pin_type_name (with optional sub-object / direction / host glob filters). */
+	static FMonolithActionResult FindPinsByType(const TSharedPtr<FJsonObject>& Params);
+
+	/** Reverse: every node whose `data` JSON contains a substring (optionally scoped to a property name and/or node_class). */
+	static FMonolithActionResult FindNodesByProperty(const TSharedPtr<FJsonObject>& Params);
 };

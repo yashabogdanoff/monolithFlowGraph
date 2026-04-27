@@ -176,6 +176,26 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Required(TEXT("node_class"), TEXT("string"), TEXT("Exact UClass path (e.g. \"/Script/SIMULATOR.SimulatorFlowNode_Dialogue\")"))
 			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host_fa_path"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("find_pins_by_type"),
+		TEXT("Cross-asset reverse lookup over flow_node_pins: every pin in the index whose pin_type_name matches. Optional pin_subcategory_object (UClass path for Object/Class pins or UScriptStruct path for Struct pins) further narrows results. Optional pin_direction restricts to input/output. Optional asset_path_filter glob restricts host fa_path. Rows grouped by host fa_path."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::FindPinsByType),
+		FParamSchemaBuilder()
+			.Required(TEXT("pin_type_name"), TEXT("string"), TEXT("FFlowPin pin_type_name (e.g. \"Exec\", \"Bool\", \"Object\")"))
+			.Optional(TEXT("pin_subcategory_object"), TEXT("string"), TEXT("Path of the pin's sub-object (UClass / UScriptStruct)"))
+			.Optional(TEXT("pin_direction"), TEXT("string"), TEXT("\"input\" | \"output\" | \"all\" (default)"))
+			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host fa_path"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("find_nodes_by_property"),
+		TEXT("Cross-asset reverse lookup over the per-node `data` JSON snapshot of design-time UPROPERTYs. Substring match (case-sensitive, SQL LIKE; reserved chars _ % \\ are escaped). Optional property_name scopes the match so it only fires inside `\"property_name\":...value_substring`. Optional node_class narrows to one UClass. Optional asset_path_filter glob narrows host fa_path. Returns matching nodes grouped by host fa_path with their parsed data."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::FindNodesByProperty),
+		FParamSchemaBuilder()
+			.Required(TEXT("value_substring"), TEXT("string"), TEXT("Literal substring to find inside the node `data` JSON"))
+			.Optional(TEXT("property_name"), TEXT("string"), TEXT("If set, restrict the match to the value side of `\"property_name\":...` (any nesting)"))
+			.Optional(TEXT("node_class"), TEXT("string"), TEXT("Restrict to nodes of this UClass path"))
+			.Optional(TEXT("asset_path_filter"), TEXT("string"), TEXT("Glob restricting host fa_path"))
+			.Build());
 }
 
 // ============================================================================
@@ -1134,6 +1154,206 @@ FMonolithActionResult FMonolithFlowActions::FindNodeClassUsages(const TSharedPtr
 
 	auto Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("node_class"), NodeClass);
+	Result->SetArrayField(TEXT("hosts"), Hosts);
+	Result->SetNumberField(TEXT("host_count"), Hosts.Num());
+	Result->SetNumberField(TEXT("total_node_count"), TotalNodes);
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::FindPinsByType(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString PinTypeName;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("pin_type_name"), PinTypeName) || PinTypeName.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("pin_type_name is required"));
+	}
+
+	FString SubCat, Direction, PathFilter;
+	Params->TryGetStringField(TEXT("pin_subcategory_object"), SubCat);
+	Params->TryGetStringField(TEXT("pin_direction"), Direction);
+	Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);
+
+	FString SQL = TEXT(
+		"SELECT fa.fa_path, p.node_guid, p.pin_direction, p.pin_index, p.pin_name, "
+		"p.pin_type_name, p.pin_subcategory_object, p.container_type "
+		"FROM flow_node_pins p "
+		"JOIN flow_assets fa ON fa.fa_asset_id = p.fa_asset_id "
+		"WHERE p.pin_type_name = ?");
+	int32 NextBind = 2;
+	if (!SubCat.IsEmpty())
+	{
+		SQL += TEXT(" AND p.pin_subcategory_object = ?");
+	}
+	if (!Direction.IsEmpty() && Direction != TEXT("all"))
+	{
+		SQL += TEXT(" AND p.pin_direction = ?");
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		const FString Like = GlobToLike(PathFilter);
+		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s'"), *Like);
+	}
+	SQL += TEXT(" ORDER BY fa.fa_path, p.node_guid, p.pin_direction, p.pin_index");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare find_pins_by_type SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, PinTypeName);
+	if (!SubCat.IsEmpty()) Stmt.SetBindingValueByIndex(NextBind++, SubCat);
+	if (!Direction.IsEmpty() && Direction != TEXT("all")) Stmt.SetBindingValueByIndex(NextBind++, Direction);
+
+	TMap<FString, TArray<TSharedPtr<FJsonValue>>> PinsByFa;
+	int32 TotalPins = 0;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString FaPath, Guid, Dir, PinName, TypeName, SubCatRow, Container;
+		int64 PinIdx = 0;
+		Stmt.GetColumnValueByIndex(0, FaPath);
+		Stmt.GetColumnValueByIndex(1, Guid);
+		Stmt.GetColumnValueByIndex(2, Dir);
+		Stmt.GetColumnValueByIndex(3, PinIdx);
+		Stmt.GetColumnValueByIndex(4, PinName);
+		Stmt.GetColumnValueByIndex(5, TypeName);
+		Stmt.GetColumnValueByIndex(6, SubCatRow);
+		Stmt.GetColumnValueByIndex(7, Container);
+
+		auto Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("node_guid"), Guid);
+		Row->SetStringField(TEXT("pin_direction"), Dir);
+		Row->SetNumberField(TEXT("pin_index"), PinIdx);
+		Row->SetStringField(TEXT("pin_name"), PinName);
+		Row->SetStringField(TEXT("pin_type_name"), TypeName);
+		if (!SubCatRow.IsEmpty()) Row->SetStringField(TEXT("pin_subcategory_object"), SubCatRow);
+		Row->SetStringField(TEXT("container_type"), Container);
+
+		PinsByFa.FindOrAdd(FaPath).Add(MakeShared<FJsonValueObject>(Row));
+		++TotalPins;
+	}
+	Stmt.Destroy();
+
+	TArray<TSharedPtr<FJsonValue>> Hosts;
+	for (const TPair<FString, TArray<TSharedPtr<FJsonValue>>>& Pair : PinsByFa)
+	{
+		auto HostObj = MakeShared<FJsonObject>();
+		HostObj->SetStringField(TEXT("fa_path"), Pair.Key);
+		HostObj->SetArrayField(TEXT("pins"), Pair.Value);
+		HostObj->SetNumberField(TEXT("pin_count"), Pair.Value.Num());
+		Hosts.Add(MakeShared<FJsonValueObject>(HostObj));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("pin_type_name"), PinTypeName);
+	if (!SubCat.IsEmpty()) Result->SetStringField(TEXT("pin_subcategory_object"), SubCat);
+	Result->SetArrayField(TEXT("hosts"), Hosts);
+	Result->SetNumberField(TEXT("host_count"), Hosts.Num());
+	Result->SetNumberField(TEXT("total_pin_count"), TotalPins);
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::FindNodesByProperty(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString ValueSub;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("value_substring"), ValueSub) || ValueSub.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("value_substring is required"));
+	}
+
+	FString PropName, NodeClassFilter, PathFilter;
+	Params->TryGetStringField(TEXT("property_name"), PropName);
+	Params->TryGetStringField(TEXT("node_class"), NodeClassFilter);
+	Params->TryGetStringField(TEXT("asset_path_filter"), PathFilter);
+
+	// Escape SQL LIKE wildcards in user input — we want literal substring match. ESCAPE char is backslash.
+	auto EscapeLike = [](const FString& In) -> FString
+	{
+		return In
+			.Replace(TEXT("\\"), TEXT("\\\\"))
+			.Replace(TEXT("%"),  TEXT("\\%"))
+			.Replace(TEXT("_"),  TEXT("\\_"));
+	};
+
+	const FString EscValue = EscapeLike(ValueSub);
+	FString DataPattern;
+	if (!PropName.IsEmpty())
+	{
+		const FString EscProp = EscapeLike(PropName);
+		DataPattern = FString::Printf(TEXT("%%\"%s\"%%%s%%"), *EscProp, *EscValue);
+	}
+	else
+	{
+		DataPattern = FString::Printf(TEXT("%%%s%%"), *EscValue);
+	}
+
+	FString SQL = TEXT(
+		"SELECT fa.fa_path, n.node_guid, n.node_class, n.display_name, n.data "
+		"FROM flow_nodes n "
+		"JOIN flow_assets fa ON fa.fa_asset_id = n.fa_asset_id "
+		"WHERE n.data LIKE ? ESCAPE '\\'");
+	int32 NextBind = 2;
+	if (!NodeClassFilter.IsEmpty())
+	{
+		SQL += TEXT(" AND n.node_class = ?");
+	}
+	if (!PathFilter.IsEmpty())
+	{
+		const FString FaLike = GlobToLike(PathFilter);
+		SQL += FString::Printf(TEXT(" AND fa.fa_path LIKE '%s'"), *FaLike);
+	}
+	SQL += TEXT(" ORDER BY fa.fa_path, n.node_guid");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare find_nodes_by_property SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, DataPattern);
+	if (!NodeClassFilter.IsEmpty()) Stmt.SetBindingValueByIndex(NextBind++, NodeClassFilter);
+
+	TMap<FString, TArray<TSharedPtr<FJsonValue>>> NodesByFa;
+	int32 TotalNodes = 0;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString FaPath, Guid, Cls, Display, DataJson;
+		Stmt.GetColumnValueByIndex(0, FaPath);
+		Stmt.GetColumnValueByIndex(1, Guid);
+		Stmt.GetColumnValueByIndex(2, Cls);
+		Stmt.GetColumnValueByIndex(3, Display);
+		Stmt.GetColumnValueByIndex(4, DataJson);
+
+		auto NodeObj = MakeShared<FJsonObject>();
+		NodeObj->SetStringField(TEXT("node_guid"), Guid);
+		NodeObj->SetStringField(TEXT("node_class"), Cls);
+		if (!Display.IsEmpty()) NodeObj->SetStringField(TEXT("display_name"), Display);
+		NodeObj->SetField(TEXT("data"), TryParseJsonValue(DataJson));
+
+		NodesByFa.FindOrAdd(FaPath).Add(MakeShared<FJsonValueObject>(NodeObj));
+		++TotalNodes;
+	}
+	Stmt.Destroy();
+
+	TArray<TSharedPtr<FJsonValue>> Hosts;
+	for (const TPair<FString, TArray<TSharedPtr<FJsonValue>>>& Pair : NodesByFa)
+	{
+		auto HostObj = MakeShared<FJsonObject>();
+		HostObj->SetStringField(TEXT("fa_path"), Pair.Key);
+		HostObj->SetArrayField(TEXT("nodes"), Pair.Value);
+		HostObj->SetNumberField(TEXT("node_count"), Pair.Value.Num());
+		Hosts.Add(MakeShared<FJsonValueObject>(HostObj));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("value_substring"), ValueSub);
+	if (!PropName.IsEmpty()) Result->SetStringField(TEXT("property_name"), PropName);
 	Result->SetArrayField(TEXT("hosts"), Hosts);
 	Result->SetNumberField(TEXT("host_count"), Hosts.Num());
 	Result->SetNumberField(TEXT("total_node_count"), TotalNodes);
