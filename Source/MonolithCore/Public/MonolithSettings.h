@@ -110,6 +110,10 @@ public:
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
 	bool bIndexLevelSequences = true;
 
+	/** Enable Flow Graph asset indexing (UFlowAsset, UFlowAssetParams, UFlowNodeBlueprint, UFlowNodeAddOnBlueprint) */
+	UPROPERTY(config, EditAnywhere, Category="Indexing|Deep Indexers")
+	bool bIndexFlow = true;
+
 	/** Enable dependency graph indexing */
 	UPROPERTY(config, EditAnywhere, Category="Indexing|Post-Pass Indexers")
 	bool bIndexDependencies = true;
@@ -236,6 +240,11 @@ public:
 		meta=(DisplayName="Enable Logic Driver Integration",
 			  ToolTip="When enabled and Logic Driver Pro is installed, registers logicdriver_query actions for state machine manipulation."))
 	bool bEnableLogicDriver = true;
+
+	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
+		meta=(DisplayName="Enable Flow Graph Integration",
+			  ToolTip="When enabled and the Flow plugin (https://github.com/MothCocoon/FlowGraph) is installed, registers flow_query actions for Flow asset, params, and node-blueprint introspection."))
+	bool bEnableFlow = true;
 
 	UPROPERTY(config, EditAnywhere, Category="Modules|Optional",
 		meta=(DisplayName="Enable AI Module",
