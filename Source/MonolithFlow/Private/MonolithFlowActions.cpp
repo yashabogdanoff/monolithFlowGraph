@@ -127,6 +127,31 @@ void FMonolithFlowActions::RegisterActions(FMonolithToolRegistry& Registry)
 			.Optional(TEXT("pin_direction"), TEXT("string"), TEXT("\"input\" | \"output\" | \"all\" (default)"))
 			.Optional(TEXT("pin_type_name"), TEXT("string"), TEXT("Restrict to pins with this PinTypeName (e.g. \"Exec\", \"Bool\", \"Object\")"))
 			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("list_connections"),
+		TEXT("List every output-pin -> input-pin connection inside one Flow Asset (one row per outgoing edge). Optional from_node_guid / to_node_guid filters narrow the result."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListConnections),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Optional(TEXT("from_node_guid"), TEXT("string"), TEXT("Restrict to edges originating at this node"))
+			.Optional(TEXT("to_node_guid"), TEXT("string"), TEXT("Restrict to edges terminating at this node"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("list_addons"),
+		TEXT("List every UFlowNodeAddOn attached to nodes in one Flow Asset (recursive — addons can have child addons). Each row carries owner_node_guid, parent_addon_id (NULL for top-level), depth, addon_class, and parsed `data` JSON of the addon's design-time UPROPERTYs. Optional node_guid filter restricts to one node's addon stack."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::ListAddons),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Optional(TEXT("node_guid"), TEXT("string"), TEXT("Restrict to addons under this node"))
+			.Build());
+
+	Registry.RegisterAction(TEXT("flow"), TEXT("get_node_info"),
+		TEXT("Single-node deep dive. Joins the flow_nodes row with its parsed `data` JSON, every pin (with type info), every outgoing connection, and the recursive addon tree for one node identified by GUID inside one Flow Asset."),
+		FMonolithActionHandler::CreateStatic(&FMonolithFlowActions::GetNodeInfo),
+		FParamSchemaBuilder()
+			.Required(TEXT("asset_path"), TEXT("string"), TEXT("Full UFlowAsset object path"))
+			.Required(TEXT("node_guid"), TEXT("string"), TEXT("Node FGuid string (digits-with-hyphens, matches list_nodes output)"))
+			.Build());
 }
 
 // ============================================================================
@@ -421,6 +446,183 @@ FMonolithActionResult FMonolithFlowActions::ListNodes(const TSharedPtr<FJsonObje
 	return FMonolithActionResult::Success(Result);
 }
 
+// ----- Internal helpers shared by Step 3 actions -----
+
+namespace
+{
+	/** Read every pin row for one node into a JSON array (used by GetNodeInfo). */
+	TArray<TSharedPtr<FJsonValue>> ReadPinsForNode(FSQLiteDatabase* RawDB, int64 FaAssetId, const FString& NodeGuid)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(*RawDB, TEXT(
+			"SELECT pin_direction, pin_index, pin_name, pin_friendly_name, "
+			"pin_type_name, pin_subcategory_object, container_type, tooltip "
+			"FROM flow_node_pins WHERE fa_asset_id = ? AND node_guid = ? "
+			"ORDER BY pin_direction, pin_index")))
+		{
+			return Out;
+		}
+		Stmt.SetBindingValueByIndex(1, FaAssetId);
+		Stmt.SetBindingValueByIndex(2, NodeGuid);
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FString Dir, PinName, Friendly, TypeName, SubCat, Container, Tooltip;
+			int64 PinIdx = 0;
+			Stmt.GetColumnValueByIndex(0, Dir);
+			Stmt.GetColumnValueByIndex(1, PinIdx);
+			Stmt.GetColumnValueByIndex(2, PinName);
+			Stmt.GetColumnValueByIndex(3, Friendly);
+			Stmt.GetColumnValueByIndex(4, TypeName);
+			Stmt.GetColumnValueByIndex(5, SubCat);
+			Stmt.GetColumnValueByIndex(6, Container);
+			Stmt.GetColumnValueByIndex(7, Tooltip);
+
+			auto Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("pin_direction"), Dir);
+			Row->SetNumberField(TEXT("pin_index"), PinIdx);
+			Row->SetStringField(TEXT("pin_name"), PinName);
+			if (!Friendly.IsEmpty()) Row->SetStringField(TEXT("pin_friendly_name"), Friendly);
+			Row->SetStringField(TEXT("pin_type_name"), TypeName);
+			if (!SubCat.IsEmpty()) Row->SetStringField(TEXT("pin_subcategory_object"), SubCat);
+			Row->SetStringField(TEXT("container_type"), Container);
+			if (!Tooltip.IsEmpty()) Row->SetStringField(TEXT("tooltip"), Tooltip);
+			Out.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		Stmt.Destroy();
+		return Out;
+	}
+
+	/** Read outgoing connections for one node into a JSON array. */
+	TArray<TSharedPtr<FJsonValue>> ReadOutgoingConnections(FSQLiteDatabase* RawDB, int64 FaAssetId, const FString& NodeGuid)
+	{
+		TArray<TSharedPtr<FJsonValue>> Out;
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(*RawDB, TEXT(
+			"SELECT from_pin, to_node_guid, to_pin "
+			"FROM flow_node_connections WHERE fa_asset_id = ? AND from_node_guid = ? "
+			"ORDER BY from_pin, to_node_guid")))
+		{
+			return Out;
+		}
+		Stmt.SetBindingValueByIndex(1, FaAssetId);
+		Stmt.SetBindingValueByIndex(2, NodeGuid);
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FString FromPin, ToGuid, ToPin;
+			Stmt.GetColumnValueByIndex(0, FromPin);
+			Stmt.GetColumnValueByIndex(1, ToGuid);
+			Stmt.GetColumnValueByIndex(2, ToPin);
+
+			auto Row = MakeShared<FJsonObject>();
+			Row->SetStringField(TEXT("from_pin"), FromPin);
+			Row->SetStringField(TEXT("to_node_guid"), ToGuid);
+			Row->SetStringField(TEXT("to_pin"), ToPin);
+			Out.Add(MakeShared<FJsonValueObject>(Row));
+		}
+		Stmt.Destroy();
+		return Out;
+	}
+
+	/**
+	 * Read all addons under a node and assemble a tree of JSON objects.
+	 * Each addon row becomes:
+	 *   { id, addon_class, addon_index, depth, data, children: [...recursive...] }
+	 */
+	TArray<TSharedPtr<FJsonValue>> ReadAddonTreeForNode(FSQLiteDatabase* RawDB, int64 FaAssetId, const FString& NodeGuid)
+	{
+		// Single SELECT, then assemble in memory by parent_addon_id.
+		struct FAddonRow
+		{
+			int64 Id;
+			int64 ParentId; // -1 when NULL
+			FString AddonClass;
+			int64 AddonIndex;
+			int64 Depth;
+			FString DataJson;
+		};
+		TArray<FAddonRow> Rows;
+
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(*RawDB, TEXT(
+			"SELECT id, parent_addon_id, addon_class, addon_index, depth, data "
+			"FROM flow_node_addons WHERE fa_asset_id = ? AND owner_node_guid = ? "
+			"ORDER BY depth, addon_index")))
+		{
+			return {};
+		}
+		Stmt.SetBindingValueByIndex(1, FaAssetId);
+		Stmt.SetBindingValueByIndex(2, NodeGuid);
+		while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			FAddonRow R;
+			Stmt.GetColumnValueByIndex(0, R.Id);
+			// SQLite returns 0 for NULL via the int64 overload — we re-check with a separate IS NULL helper if needed.
+			// Trick: read parent as text then re-parse, or use IsColumnValueNull. Simpler: use IFNULL in SQL.
+			int64 ParentRaw = 0;
+			Stmt.GetColumnValueByIndex(1, ParentRaw);
+			R.ParentId = (ParentRaw > 0) ? ParentRaw : -1;
+			Stmt.GetColumnValueByIndex(2, R.AddonClass);
+			Stmt.GetColumnValueByIndex(3, R.AddonIndex);
+			Stmt.GetColumnValueByIndex(4, R.Depth);
+			Stmt.GetColumnValueByIndex(5, R.DataJson);
+			Rows.Add(MoveTemp(R));
+		}
+		Stmt.Destroy();
+
+		// Build JSON objects keyed by id.
+		TMap<int64, TSharedPtr<FJsonObject>> NodesById;
+		for (const FAddonRow& R : Rows)
+		{
+			auto Obj = MakeShared<FJsonObject>();
+			Obj->SetNumberField(TEXT("id"), R.Id);
+			Obj->SetStringField(TEXT("addon_class"), R.AddonClass);
+			Obj->SetNumberField(TEXT("addon_index"), R.AddonIndex);
+			Obj->SetNumberField(TEXT("depth"), R.Depth);
+			TSharedPtr<FJsonValue> DataVal;
+			if (!R.DataJson.IsEmpty())
+			{
+				TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(R.DataJson);
+				if (!FJsonSerializer::Deserialize(Reader, DataVal) || !DataVal.IsValid())
+				{
+					DataVal = MakeShared<FJsonValueNull>();
+				}
+			}
+			else
+			{
+				DataVal = MakeShared<FJsonValueNull>();
+			}
+			Obj->SetField(TEXT("data"), DataVal);
+			Obj->SetArrayField(TEXT("children"), {});
+			NodesById.Add(R.Id, Obj);
+		}
+
+		// Link children to parents.
+		TArray<TSharedPtr<FJsonValue>> Roots;
+		for (const FAddonRow& R : Rows)
+		{
+			TSharedPtr<FJsonObject> Self = NodesById.FindRef(R.Id);
+			if (!Self.IsValid()) continue;
+
+			if (R.ParentId > 0)
+			{
+				if (TSharedPtr<FJsonObject> Parent = NodesById.FindRef(R.ParentId))
+				{
+					TArray<TSharedPtr<FJsonValue>> Children = Parent->GetArrayField(TEXT("children"));
+					Children.Add(MakeShared<FJsonValueObject>(Self));
+					Parent->SetArrayField(TEXT("children"), Children);
+				}
+			}
+			else
+			{
+				Roots.Add(MakeShared<FJsonValueObject>(Self));
+			}
+		}
+
+		return Roots;
+	}
+}
+
 FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonObject>& Params)
 {
 	FString Err;
@@ -508,5 +710,219 @@ FMonolithActionResult FMonolithFlowActions::ListNodePins(const TSharedPtr<FJsonO
 	Result->SetStringField(TEXT("fa_path"), AssetPath);
 	Result->SetArrayField(TEXT("pins"), Rows);
 	Result->SetNumberField(TEXT("count"), Rows.Num());
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::ListConnections(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString AssetPath;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path is required"));
+	}
+
+	int64 RowId = -1, AssetId = -1;
+	SelectFlowAssetIds(RawDB, AssetPath, RowId, AssetId);
+	if (RowId <= 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No Flow Asset indexed at path '%s'."), *AssetPath));
+	}
+
+	FString FromGuid, ToGuid;
+	Params->TryGetStringField(TEXT("from_node_guid"), FromGuid);
+	Params->TryGetStringField(TEXT("to_node_guid"), ToGuid);
+
+	FString SQL = TEXT(
+		"SELECT from_node_guid, from_pin, to_node_guid, to_pin "
+		"FROM flow_node_connections WHERE fa_asset_id = ?");
+	int32 NextBind = 2;
+	if (!FromGuid.IsEmpty()) SQL += TEXT(" AND from_node_guid = ?");
+	if (!ToGuid.IsEmpty())   SQL += TEXT(" AND to_node_guid = ?");
+	SQL += TEXT(" ORDER BY from_node_guid, from_pin, to_node_guid");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare list_connections SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, AssetId);
+	if (!FromGuid.IsEmpty()) Stmt.SetBindingValueByIndex(NextBind++, FromGuid);
+	if (!ToGuid.IsEmpty())   Stmt.SetBindingValueByIndex(NextBind++, ToGuid);
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		FString FromG, FromP, ToG, ToP;
+		Stmt.GetColumnValueByIndex(0, FromG);
+		Stmt.GetColumnValueByIndex(1, FromP);
+		Stmt.GetColumnValueByIndex(2, ToG);
+		Stmt.GetColumnValueByIndex(3, ToP);
+
+		auto Row = MakeShared<FJsonObject>();
+		Row->SetStringField(TEXT("from_node_guid"), FromG);
+		Row->SetStringField(TEXT("from_pin"), FromP);
+		Row->SetStringField(TEXT("to_node_guid"), ToG);
+		Row->SetStringField(TEXT("to_pin"), ToP);
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+	Stmt.Destroy();
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("fa_path"), AssetPath);
+	Result->SetArrayField(TEXT("connections"), Rows);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::ListAddons(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString AssetPath;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path is required"));
+	}
+
+	int64 RowId = -1, AssetId = -1;
+	SelectFlowAssetIds(RawDB, AssetPath, RowId, AssetId);
+	if (RowId <= 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No Flow Asset indexed at path '%s'."), *AssetPath));
+	}
+
+	FString NodeGuid;
+	Params->TryGetStringField(TEXT("node_guid"), NodeGuid);
+
+	FString SQL = TEXT(
+		"SELECT id, owner_node_guid, parent_addon_id, addon_class, addon_index, depth, data "
+		"FROM flow_node_addons WHERE fa_asset_id = ?");
+	if (!NodeGuid.IsEmpty()) SQL += TEXT(" AND owner_node_guid = ?");
+	SQL += TEXT(" ORDER BY owner_node_guid, depth, addon_index");
+
+	FSQLitePreparedStatement Stmt;
+	if (!Stmt.Create(*RawDB, *SQL))
+	{
+		return FMonolithActionResult::Error(TEXT("Failed to prepare list_addons SQL"));
+	}
+	Stmt.SetBindingValueByIndex(1, AssetId);
+	if (!NodeGuid.IsEmpty()) Stmt.SetBindingValueByIndex(2, NodeGuid);
+
+	TArray<TSharedPtr<FJsonValue>> Rows;
+	while (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+	{
+		int64 Id = 0, ParentId = 0, AddonIdx = 0, Depth = 0;
+		FString Owner, Cls, DataJson;
+		Stmt.GetColumnValueByIndex(0, Id);
+		Stmt.GetColumnValueByIndex(1, Owner);
+		Stmt.GetColumnValueByIndex(2, ParentId);
+		Stmt.GetColumnValueByIndex(3, Cls);
+		Stmt.GetColumnValueByIndex(4, AddonIdx);
+		Stmt.GetColumnValueByIndex(5, Depth);
+		Stmt.GetColumnValueByIndex(6, DataJson);
+
+		auto Row = MakeShared<FJsonObject>();
+		Row->SetNumberField(TEXT("id"), Id);
+		Row->SetStringField(TEXT("owner_node_guid"), Owner);
+		if (ParentId > 0) Row->SetNumberField(TEXT("parent_addon_id"), ParentId);
+		Row->SetStringField(TEXT("addon_class"), Cls);
+		Row->SetNumberField(TEXT("addon_index"), AddonIdx);
+		Row->SetNumberField(TEXT("depth"), Depth);
+		Row->SetField(TEXT("data"), TryParseJsonValue(DataJson));
+		Rows.Add(MakeShared<FJsonValueObject>(Row));
+	}
+	Stmt.Destroy();
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("fa_path"), AssetPath);
+	Result->SetArrayField(TEXT("addons"), Rows);
+	Result->SetNumberField(TEXT("count"), Rows.Num());
+	return FMonolithActionResult::Success(Result);
+}
+
+FMonolithActionResult FMonolithFlowActions::GetNodeInfo(const TSharedPtr<FJsonObject>& Params)
+{
+	FString Err;
+	FSQLiteDatabase* RawDB = GetRawDB(Err);
+	if (!RawDB) return FMonolithActionResult::Error(Err);
+
+	FString AssetPath, NodeGuid;
+	if (!Params.IsValid() || !Params->TryGetStringField(TEXT("asset_path"), AssetPath) || AssetPath.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("asset_path is required"));
+	}
+	if (!Params->TryGetStringField(TEXT("node_guid"), NodeGuid) || NodeGuid.IsEmpty())
+	{
+		return FMonolithActionResult::Error(TEXT("node_guid is required"));
+	}
+
+	int64 RowId = -1, AssetId = -1;
+	SelectFlowAssetIds(RawDB, AssetPath, RowId, AssetId);
+	if (RowId <= 0)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No Flow Asset indexed at path '%s'."), *AssetPath));
+	}
+
+	auto Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("fa_path"), AssetPath);
+	Result->SetStringField(TEXT("node_guid"), NodeGuid);
+
+	bool bFound = false;
+	{
+		FSQLitePreparedStatement Stmt;
+		if (!Stmt.Create(*RawDB, TEXT(
+			"SELECT node_class, display_name, is_blueprint, blueprint_path, "
+			"addon_count, input_pin_count, output_pin_count, data "
+			"FROM flow_nodes WHERE fa_asset_id = ? AND node_guid = ?")))
+		{
+			return FMonolithActionResult::Error(TEXT("Failed to prepare get_node_info SQL"));
+		}
+		Stmt.SetBindingValueByIndex(1, AssetId);
+		Stmt.SetBindingValueByIndex(2, NodeGuid);
+		if (Stmt.Step() == ESQLitePreparedStatementStepResult::Row)
+		{
+			bFound = true;
+			FString Cls, Display, BpPath, DataJson;
+			int64 IsBp = 0, AddonN = 0, InN = 0, OutN = 0;
+			Stmt.GetColumnValueByIndex(0, Cls);
+			Stmt.GetColumnValueByIndex(1, Display);
+			Stmt.GetColumnValueByIndex(2, IsBp);
+			Stmt.GetColumnValueByIndex(3, BpPath);
+			Stmt.GetColumnValueByIndex(4, AddonN);
+			Stmt.GetColumnValueByIndex(5, InN);
+			Stmt.GetColumnValueByIndex(6, OutN);
+			Stmt.GetColumnValueByIndex(7, DataJson);
+
+			Result->SetStringField(TEXT("node_class"), Cls);
+			if (!Display.IsEmpty()) Result->SetStringField(TEXT("display_name"), Display);
+			Result->SetBoolField(TEXT("is_blueprint"), IsBp != 0);
+			if (!BpPath.IsEmpty()) Result->SetStringField(TEXT("blueprint_path"), BpPath);
+			Result->SetNumberField(TEXT("addon_count"), AddonN);
+			Result->SetNumberField(TEXT("input_pin_count"), InN);
+			Result->SetNumberField(TEXT("output_pin_count"), OutN);
+			Result->SetField(TEXT("data"), TryParseJsonValue(DataJson));
+		}
+		Stmt.Destroy();
+	}
+
+	if (!bFound)
+	{
+		return FMonolithActionResult::Error(FString::Printf(
+			TEXT("No node with guid '%s' in '%s'."), *NodeGuid, *AssetPath));
+	}
+
+	Result->SetArrayField(TEXT("pins"), ReadPinsForNode(RawDB, AssetId, NodeGuid));
+	Result->SetArrayField(TEXT("outgoing_connections"), ReadOutgoingConnections(RawDB, AssetId, NodeGuid));
+	Result->SetArrayField(TEXT("addons"), ReadAddonTreeForNode(RawDB, AssetId, NodeGuid));
+
 	return FMonolithActionResult::Success(Result);
 }

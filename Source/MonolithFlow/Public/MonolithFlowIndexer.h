@@ -17,11 +17,11 @@ class FMonolithIndexDatabase;
  * Per-node UPROPERTY snapshots are written to flow_nodes.data as compact JSON
  * (FJsonObjectConverter::UStructToJsonObjectString with CPF_Transient skipped).
  *
- * Tables created (Step 2 subset; Steps 3+ extend):
- *   flow_assets                 (this step)
- *   flow_nodes                  (this step, with .data JSON column)
- *   flow_node_pins              (this step)
- *   flow_node_addons            (Step 3, with .data JSON column)
+ * Tables created (Steps 2-3; Steps 4+ extend):
+ *   flow_assets                 (Step 2)
+ *   flow_nodes                  (Step 2, with .data JSON column)
+ *   flow_node_pins              (Step 2)
+ *   flow_node_addons            (Step 3, with .data JSON column, recursive)
  *   flow_node_connections       (Step 3)
  *   flow_subgraph_refs          (Step 4)
  *   flow_custom_events          (Step 4)

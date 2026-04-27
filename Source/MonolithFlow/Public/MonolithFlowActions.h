@@ -30,4 +30,13 @@ public:
 
 	/** Pins for nodes in one Flow Asset (optional node_guid / pin_direction / pin_type_name filter). */
 	static FMonolithActionResult ListNodePins(const TSharedPtr<FJsonObject>& Params);
+
+	/** Full edge list of one Flow Asset (output pin -> input pin). */
+	static FMonolithActionResult ListConnections(const TSharedPtr<FJsonObject>& Params);
+
+	/** AddOns inside one Flow Asset (optional node_guid filter). */
+	static FMonolithActionResult ListAddons(const TSharedPtr<FJsonObject>& Params);
+
+	/** Single-node deep dive: row + parsed data + pins + connections + addon tree. */
+	static FMonolithActionResult GetNodeInfo(const TSharedPtr<FJsonObject>& Params);
 };

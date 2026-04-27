@@ -6,6 +6,7 @@
 #include "FlowAsset.h"
 #include "Nodes/FlowNode.h"
 #include "Nodes/FlowNodeBase.h"
+#include "AddOns/FlowNodeAddOn.h"
 #include "Nodes/FlowPin.h"
 #include "Nodes/FlowNodeBlueprint.h"
 #include "Nodes/FlowNodeAddOnBlueprint.h"
@@ -140,6 +141,76 @@ namespace
 		return FString();
 	}
 
+	/** Insert one outgoing connection (output pin -> connected input pin on another node). */
+	void InsertConnection(
+		FSQLitePreparedStatement& Stmt,
+		int64 FaAssetId,
+		const FString& FromNodeGuid,
+		const FString& FromPin,
+		const FString& ToNodeGuid,
+		const FString& ToPin)
+	{
+		Stmt.Reset();
+		Stmt.ClearBindings();
+		Stmt.SetBindingValueByIndex(1, FaAssetId);
+		Stmt.SetBindingValueByIndex(2, FromNodeGuid);
+		Stmt.SetBindingValueByIndex(3, FromPin);
+		Stmt.SetBindingValueByIndex(4, ToNodeGuid);
+		Stmt.SetBindingValueByIndex(5, ToPin);
+		Stmt.Execute();
+	}
+
+	/**
+	 * Recursively walk a node/addon's child AddOns, writing each into
+	 * flow_node_addons. Returns the total addon count under this owner.
+	 *
+	 * - OwnerNodeGuid stays the same all the way down the recursion
+	 *   (the top-level UFlowNode this addon stack ultimately belongs to).
+	 * - ParentAddonRowId is -1 for direct children of the node, then the
+	 *   row id of the parent addon for nested addons.
+	 * - Depth: 0 for direct children of the node, +1 per level.
+	 */
+	int32 WalkAndInsertAddOns(
+		FSQLiteDatabase* RawDB,
+		FSQLitePreparedStatement& InsertStmt,
+		int64 FaAssetId,
+		UFlowNodeBase* Owner,
+		const FString& OwnerNodeGuid,
+		int64 ParentAddonRowId,
+		int32 Depth)
+	{
+		if (!RawDB || !Owner) return 0;
+
+		int32 Total = 0;
+		const TArray<UFlowNodeAddOn*>& AddOns = Owner->GetFlowNodeAddOnChildren();
+		for (int32 Idx = 0; Idx < AddOns.Num(); ++Idx)
+		{
+			UFlowNodeAddOn* AddOn = AddOns[Idx];
+			if (!AddOn) continue;
+
+			const FString AddOnClassPath = AddOn->GetClass()->GetPathName();
+			const FString DataJson = SerializeInstancePropertiesToJson(AddOn);
+
+			InsertStmt.Reset();
+			InsertStmt.ClearBindings();
+			InsertStmt.SetBindingValueByIndex(1, FaAssetId);
+			InsertStmt.SetBindingValueByIndex(2, OwnerNodeGuid);
+			BindOptionalRowId(InsertStmt, 3, ParentAddonRowId);
+			InsertStmt.SetBindingValueByIndex(4, AddOnClassPath);
+			InsertStmt.SetBindingValueByIndex(5, Idx);
+			InsertStmt.SetBindingValueByIndex(6, Depth);
+			BindNullableString(InsertStmt, 7, DataJson);
+			InsertStmt.Execute();
+
+			const int64 NewRowId = RawDB->GetLastInsertRowId();
+			++Total;
+
+			// Recurse — addons can have child addons.
+			Total += WalkAndInsertAddOns(RawDB, InsertStmt, FaAssetId, AddOn, OwnerNodeGuid, NewRowId, Depth + 1);
+		}
+		return Total;
+	}
+
 	/** Walk a pin array writing one row per pin. */
 	void InsertPinsForDirection(
 		FSQLiteDatabase* RawDB,
@@ -268,6 +339,36 @@ void FMonolithFlowIndexer::EnsureTablesExist(FMonolithIndexDatabase& DB)
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_pins_node ON flow_node_pins(node_guid)"));
 	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_pins_type ON flow_node_pins(pin_type_name)"));
 
+	RawDB->Execute(TEXT(
+		"CREATE TABLE IF NOT EXISTS flow_node_addons ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  fa_asset_id INTEGER NOT NULL,"
+		"  owner_node_guid TEXT NOT NULL,"
+		"  parent_addon_id INTEGER,"
+		"  addon_class TEXT NOT NULL,"
+		"  addon_index INTEGER NOT NULL,"
+		"  depth INTEGER NOT NULL DEFAULT 0,"
+		"  data TEXT"
+		")"
+	));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_addons_fa ON flow_node_addons(fa_asset_id)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_addons_owner ON flow_node_addons(owner_node_guid)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_addons_class ON flow_node_addons(addon_class)"));
+
+	RawDB->Execute(TEXT(
+		"CREATE TABLE IF NOT EXISTS flow_node_connections ("
+		"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+		"  fa_asset_id INTEGER NOT NULL,"
+		"  from_node_guid TEXT NOT NULL,"
+		"  from_pin TEXT NOT NULL,"
+		"  to_node_guid TEXT NOT NULL,"
+		"  to_pin TEXT NOT NULL"
+		")"
+	));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_fa ON flow_node_connections(fa_asset_id)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_from ON flow_node_connections(from_node_guid)"));
+	RawDB->Execute(TEXT("CREATE INDEX IF NOT EXISTS idx_flow_conn_to ON flow_node_connections(to_node_guid)"));
+
 	bTablesCreated = true;
 }
 
@@ -295,12 +396,16 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 	if (PrevAssetId > 0)
 	{
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), PrevAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), PrevAssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), PrevAssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), PrevAssetId);
 	}
 	// Also clean by current AssetId in case PrevAssetId differs (autoincrement restart)
 	if (AssetId != PrevAssetId)
 	{
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_pins WHERE fa_asset_id = ?"), AssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_addons WHERE fa_asset_id = ?"), AssetId);
+		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_node_connections WHERE fa_asset_id = ?"), AssetId);
 		ExecWithInt64(RawDB, TEXT("DELETE FROM flow_nodes WHERE fa_asset_id = ?"), AssetId);
 	}
 
@@ -351,17 +456,39 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 
 	// ----- Walk nodes -----
 	int32 NodeCount = 0;
+	int32 TotalAddonCount = 0;
 
 	FSQLitePreparedStatement NodeStmt;
 	const bool bNodeStmtOk = NodeStmt.Create(*RawDB, TEXT(
 		"INSERT INTO flow_nodes ("
 		"fa_asset_id, node_guid, node_class, display_name, is_blueprint, blueprint_path, "
 		"addon_count, input_pin_count, output_pin_count, data"
-		") VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)"));
+		") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"));
 
 	if (!bNodeStmtOk)
 	{
 		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: failed to prepare flow_nodes INSERT"));
+		return false;
+	}
+
+	FSQLitePreparedStatement ConnStmt;
+	const bool bConnStmtOk = ConnStmt.Create(*RawDB, TEXT(
+		"INSERT INTO flow_node_connections ("
+		"fa_asset_id, from_node_guid, from_pin, to_node_guid, to_pin"
+		") VALUES (?, ?, ?, ?, ?)"));
+
+	FSQLitePreparedStatement AddOnStmt;
+	const bool bAddOnStmtOk = AddOnStmt.Create(*RawDB, TEXT(
+		"INSERT INTO flow_node_addons ("
+		"fa_asset_id, owner_node_guid, parent_addon_id, addon_class, addon_index, depth, data"
+		") VALUES (?, ?, ?, ?, ?, ?, ?)"));
+
+	if (!bConnStmtOk || !bAddOnStmtOk)
+	{
+		UE_LOG(LogMonolithFlowIndexer, Warning, TEXT("FMonolithFlowIndexer: failed to prepare connections/addons INSERTs"));
+		NodeStmt.Destroy();
+		if (bConnStmtOk) ConnStmt.Destroy();
+		if (bAddOnStmtOk) AddOnStmt.Destroy();
 		return false;
 	}
 
@@ -383,6 +510,12 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 
 		const FString DataJson = SerializeInstancePropertiesToJson(Node);
 
+		// Walk addons first so we know the count before inserting the node row.
+		const int32 NodeAddonCount = WalkAndInsertAddOns(
+			RawDB, AddOnStmt, AssetId, Node, NodeGuidStr,
+			/*ParentAddonRowId=*/-1, /*Depth=*/0);
+		TotalAddonCount += NodeAddonCount;
+
 		NodeStmt.Reset();
 		NodeStmt.ClearBindings();
 		NodeStmt.SetBindingValueByIndex(1, AssetId);
@@ -391,32 +524,52 @@ bool FMonolithFlowIndexer::IndexAsset(const FAssetData& AssetData, UObject* Load
 		BindNullableString(NodeStmt, 4, DisplayName);
 		NodeStmt.SetBindingValueByIndex(5, bIsBp ? 1 : 0);
 		BindNullableString(NodeStmt, 6, BpPath);
-		NodeStmt.SetBindingValueByIndex(7, InPins.Num());
-		NodeStmt.SetBindingValueByIndex(8, OutPins.Num());
-		BindNullableString(NodeStmt, 9, DataJson);
+		NodeStmt.SetBindingValueByIndex(7, NodeAddonCount);
+		NodeStmt.SetBindingValueByIndex(8, InPins.Num());
+		NodeStmt.SetBindingValueByIndex(9, OutPins.Num());
+		BindNullableString(NodeStmt, 10, DataJson);
 		NodeStmt.Execute();
 
 		// Pins
 		InsertPinsForDirection(RawDB, AssetId, NodeGuidStr, InPins, TEXT("input"));
 		InsertPinsForDirection(RawDB, AssetId, NodeGuidStr, OutPins, TEXT("output"));
+
+		// Outgoing connections — UFlowNode::Connections is protected; only
+		// per-pin GetConnection(FName) is public. Walk output pins, query
+		// each. Connections are stored on the source side of an edge per
+		// the FlowNode.h comment, so this catches every edge originating here.
+		for (const FFlowPin& OutPin : OutPins)
+		{
+			const FConnectedPin Connected = Node->GetConnection(OutPin.PinName);
+			if (!Connected.NodeGuid.IsValid()) continue;
+
+			InsertConnection(ConnStmt, AssetId,
+				NodeGuidStr,
+				OutPin.PinName.ToString(),
+				Connected.NodeGuid.ToString(EGuidFormats::DigitsWithHyphens),
+				Connected.PinName.ToString());
+		}
 	}
 
 	NodeStmt.Destroy();
+	ConnStmt.Destroy();
+	AddOnStmt.Destroy();
 
 	// ----- Update counts on flow_assets row -----
 	{
 		FSQLitePreparedStatement Stmt;
 		if (Stmt.Create(*RawDB, TEXT(
-			"UPDATE flow_assets SET node_count = ? WHERE id = ?")))
+			"UPDATE flow_assets SET node_count = ?, addon_count = ? WHERE id = ?")))
 		{
 			Stmt.SetBindingValueByIndex(1, NodeCount);
-			Stmt.SetBindingValueByIndex(2, FaRowId);
+			Stmt.SetBindingValueByIndex(2, TotalAddonCount);
+			Stmt.SetBindingValueByIndex(3, FaRowId);
 			Stmt.Execute();
 			Stmt.Destroy();
 		}
 	}
 
-	UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: indexed %s — %d nodes"), *FaPath, NodeCount);
+	UE_LOG(LogMonolithFlowIndexer, Verbose, TEXT("FMonolithFlowIndexer: indexed %s — %d nodes, %d addons"), *FaPath, NodeCount, TotalAddonCount);
 	return true;
 }
 
