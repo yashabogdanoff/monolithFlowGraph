@@ -18,7 +18,7 @@ It works with **Claude Code**, **Cursor**, or any MCP-compatible client. If your
 
 ## Why Monolith?
 
-Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (21 tools), massive capability (1288 actions across 17 in-tree namespaces; sibling plugins add their own and push the live registry higher when loaded). The AI gets oriented fast and spends its context on your actual problem.
+Most MCP integrations register every action as a separate tool, which floods the AI's context window and buries the actually useful stuff. Monolith uses a **namespace dispatch pattern** instead: each domain exposes a single `{namespace}_query(action, params)` tool, and a central `monolith_discover()` call lists everything available. Small tool list (21 tools), massive capability (1304 actions across 17 in-tree namespaces; sibling plugins add their own and push the live registry higher when loaded). The AI gets oriented fast and spends its context on your actual problem.
 
 ## What Can It Actually Do?
 
@@ -50,7 +50,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 
 **ComboGraph (13 actions)** — Integration with the ComboGraph marketplace plugin for visual combo tree editing. Graph CRUD — create, inspect, validate combo graphs. Node and edge management — add combo nodes with montage animations, wire them with edges, configure effects and cues. GAS cross-integration — scaffold combo abilities that bridge ComboGraph with Gameplay Ability System. Reflection-only integration, conditional on `#if WITH_COMBOGRAPH`.
 
-**Audio (86 actions)** — Editor-time audio asset authoring across the full UE audio pipeline. 82 audio-namespace actions plus 4 perception-binding actions (`bind_sound_to_perception` and friends, Phase J integration). Full CRUD on the 5 configurable audio asset types — SoundAttenuation, SoundClass, SoundMix, SoundConcurrency, SoundSubmix. Sound Cue graph construction — add nodes (22 types), wire them, set properties via reflection. MetaSound Builder API integration for programmatic MetaSound authoring — nodes, pins, graph inputs/outputs, interfaces, variables. Crown jewels: `build_sound_cue_from_spec` and `build_metasound_from_spec` — declarative JSON-to-graph in a single call. Batch operations for class/attenuation/submix/concurrency/compression/looping/virtualization across dozens of assets at once. Audio health checks — find unused sounds, missing attenuation, unassigned classes. Built-in `create_test_wave` (Phase J F18) generates a sine SoundWave on demand for diagnostic work. Phase J F11 added a hardened audio asset validator. Five template Sound Cues (random, layered, looping ambient, distance crossfade, switch) and four template MetaSounds (oneshot SFX, looping ambient, synth tone, interactive). SoundWave inspection is read-only; reflection-based property edits still work for batch sound wave tuning. MetaSound features gated on `#if WITH_METASOUND` — graceful degradation when absent.
+**Audio (98 actions)** — Editor-time audio asset authoring across the full UE audio pipeline. 82 baseline audio-namespace actions plus 4 perception-binding actions (`bind_sound_to_perception` and friends, Phase J integration) plus 12 v0.14.10 [Unreleased] MetaSound document introspection actions (PR #18 by @alakangas — read-side complement to the existing Builder API). Full CRUD on the 5 configurable audio asset types — SoundAttenuation, SoundClass, SoundMix, SoundConcurrency, SoundSubmix. Sound Cue graph construction — add nodes (22 types), wire them, set properties via reflection. MetaSound Builder API integration for programmatic MetaSound authoring — nodes, pins, graph inputs/outputs, interfaces, variables. MetaSound document introspection (v0.14.10) for read-only inspection of any on-disk MetaSound asset — list, document walk, summary, node instance details, connections, variables, user parameters, search, info, dependencies, validation. Crown jewels: `build_sound_cue_from_spec` and `build_metasound_from_spec` — declarative JSON-to-graph in a single call. Batch operations for class/attenuation/submix/concurrency/compression/looping/virtualization across dozens of assets at once. Audio health checks — find unused sounds, missing attenuation, unassigned classes. Built-in `create_test_wave` (Phase J F18) generates a sine SoundWave on demand for diagnostic work. Phase J F11 added a hardened audio asset validator. Five template Sound Cues (random, layered, looping ambient, distance crossfade, switch) and four template MetaSounds (oneshot SFX, looping ambient, synth tone, interactive). SoundWave inspection is read-only; reflection-based property edits still work for batch sound wave tuning. MetaSound features gated on `#if WITH_METASOUND` — graceful degradation when absent.
 
 ---
 
@@ -65,7 +65,7 @@ Most MCP integrations register every action as a separate tool, which floods the
 - **GAS (135 actions)** — Full Gameplay Ability System: abilities, AttributeSets (C++ + `ULeviathanVitalsSet` template; Blueprint sets via optional GBA), Gameplay Effects, ASC management, tags, cues, targeting, input binding, runtime inspection, scaffolding templates, accessibility-focused infinite-duration GEs. 4 attribute-binding actions surface in the `ui` namespace as aliases
 - **Logic Driver (66 actions)** — Logic Driver Pro state machines: SM CRUD, graph read/write, node config, runtime/PIE, `build_sm_from_spec`, JSON spec, scaffolding (door, health, AI patrol, dialogue, elevator, puzzle, inventory), component management
 - **ComboGraph (13 actions)** — ComboGraph combo trees: graph CRUD, nodes, edges, effects, cues, GAS cross-integration, ability scaffolding
-- **Audio (86 actions)** — Sound asset CRUD (SoundAttenuation, SoundClass, SoundMix, SoundConcurrency, SoundSubmix), Sound Cue graph building, MetaSound Builder API (conditional on `WITH_METASOUND`), batch ops, audio health checks, `build_sound_cue_from_spec`, `build_metasound_from_spec`, `apply_audio_template`, template cues + MetaSounds, sine-wave test asset factory, AI perception sound binding
+- **Audio (98 actions)** — Sound asset CRUD (SoundAttenuation, SoundClass, SoundMix, SoundConcurrency, SoundSubmix), Sound Cue graph building, MetaSound Builder API + document introspection (conditional on `WITH_METASOUND`; v0.14.10 [Unreleased] +12 introspection actions from PR #18 by @alakangas), batch ops, audio health checks, `build_sound_cue_from_spec`, `build_metasound_from_spec`, `apply_audio_template`, template cues + MetaSounds, sine-wave test asset factory, AI perception sound binding
 - **UI (96 actions)** — 42 UMG baseline + 50 CommonUI (gated on `WITH_COMMONUI`, shipped v0.14.0) + 4 GAS attribute-binding aliases. Widget Blueprint CRUD, pre-built templates (HUDs, menus, settings, inventory, save slots), styling, animation, game system scaffolding (save/load, audio, input remapping), accessibility audit, colorblind modes, text scaling
 - **Editor control (22 actions)** — UBT builds, Live Coding, error diagnosis, log search, scene capture, GIF capture, texture import, crash context, blank map factory, module status (Phase J F8)
 - **Config intelligence (6 actions)** — Full INI resolution chain, explain, diff, search across all config files
@@ -224,7 +224,7 @@ Different AI coding assistants use different conventions for project-instruction
 
 Practical prompt to feed your assistant once Monolith is installed and running:
 
-> *"I've installed the Monolith Unreal plugin. It exposes ~1288 actions across 17 namespaces (`blueprint`, `material`, `animation`, `niagara`, `mesh`, `ui`, `gas`, `ai`, `audio`, `flow`, etc.) over an in-process MCP HTTP listener at `http://localhost:9316/mcp`. What's the best-practice format for a project-instructions file for [your assistant — e.g. `CLAUDE.md`, `AGENTS.md`, `.cursorrules`]? It should help with action discovery via `monolith_discover()`, asset-path conventions like `/Game/Path/Asset`, and verifying UE 5.7 APIs via `source_query` before writing code."*
+> *"I've installed the Monolith Unreal plugin. It exposes ~1304 actions across 17 namespaces (`blueprint`, `material`, `animation`, `niagara`, `mesh`, `ui`, `gas`, `ai`, `audio`, `flow`, etc.) over an in-process MCP HTTP listener at `http://localhost:9316/mcp`. What's the best-practice format for a project-instructions file for [your assistant — e.g. `CLAUDE.md`, `AGENTS.md`, `.cursorrules`]? It should help with action discovery via `monolith_discover()`, asset-path conventions like `/Game/Path/Asset`, and verifying UE 5.7 APIs via `source_query` before writing code."*
 
 Whatever your AI generates, drop it at the appropriate path for your toolchain. The action counts and workflow notes from this README's earlier sections are usable input.
 
@@ -291,7 +291,7 @@ Standalone Tools (in Binaries/)
   monolith_query.exe    — Offline DB query tool (zero UE dependency, sqlite3 amalgamation)
 ```
 
-**1288 actions across 17 in-tree namespaces, exposed through 21 MCP tools (17 namespace dispatchers + 4 `monolith_*` meta-tools). Distinct handlers: 1284 — the `ui` namespace double-counts 4 aliased GAS attribute-binding actions. 45 town-gen experimental actions are disabled by default (`bEnableProceduralTownGen=false`); enabling them brings the in-tree registry to 1333.** Live editors with sibling plugins loaded report higher counts (sibling plugins are documented in their own repos).
+**1304 actions across 17 in-tree namespaces, exposed through 21 MCP tools (17 namespace dispatchers + 4 `monolith_*` meta-tools). Distinct handlers: 1300 — the `ui` namespace double-counts 4 aliased GAS attribute-binding actions. 45 town-gen experimental actions are disabled by default (`bEnableProceduralTownGen=false`); enabling them brings the in-tree registry to 1349.** Live editors with sibling plugins loaded report higher counts (sibling plugins are documented in their own repos).
 
 > **Fork note:** `MonolithFlow` (14 actions, `flow` namespace) is downstream-only in `feature/flow-graph-handler` of `yashabogdanoff/monolithFlowGraph`. Upstream Monolith totals are 14 actions / 1 namespace / 1 tool lower.
 
@@ -313,7 +313,7 @@ Standalone Tools (in Binaries/)
 | `logicdriver` | `logicdriver_query` | 66 | Logic Driver Pro state machines — SM CRUD, graph read/write, JSON spec, scaffolding, components. Conditional on `WITH_LOGICDRIVER` |
 | `flow` | `flow_query` | 14 | MothCocoon Flow plugin — read-only graph indexer, cross-asset reverse lookups (subgraph callers, node-class usages, pin-type, property substring), class registry. Conditional on `WITH_FLOW`. **Fork-only** |
 | `combograph` | `combograph_query` | 13 | ComboGraph combo trees — graph CRUD, nodes, edges, effects, cues, ability scaffolding. Conditional on `WITH_COMBOGRAPH` |
-| `audio` | `audio_query` | 86 | Sound asset CRUD, Sound Cue + MetaSound graph building, batch ops, audio health checks, templates, sine test wave, AI perception binding. MetaSound features conditional on `WITH_METASOUND` |
+| `audio` | `audio_query` | 98 | Sound asset CRUD, Sound Cue + MetaSound graph building (Builder API write-side), MetaSound document introspection (read-side, v0.14.10 [Unreleased] +12 from PR #18 by @alakangas), batch ops, audio health checks, templates, sine test wave, AI perception binding. MetaSound features conditional on `WITH_METASOUND` |
 | `ui` | `ui_query` | 121 (66 + 51 + 4) | UMG widget CRUD, templates, styling, animation v1+v2, EffectSurface, Spec Builder, Type Registry, settings scaffolding, accessibility. CommonUI 51 actions conditional on `WITH_COMMONUI`. 4 GAS attribute-binding aliases also live here |
 | `editor` | `editor_query` | 24 | Build triggers, error logs, compile output, crash context, scene capture, GIF capture, texture import, blank map factory, module status, UE automation test list/run |
 | `config` | `config_query` | 6 | INI resolution, explain, diff, search |
@@ -333,6 +333,7 @@ A stdio-to-HTTP proxy that keeps Claude Code MCP sessions alive across editor re
 
 - JSON-RPC message handling with editor query splitting
 - Background health poll with `notifications/tools/list_changed`
+- Stable cached/seed `tools/list` response when the editor is down at AI-client startup
 - Tool deduplication and action allowlist/denylist
 - Built with WinHTTP + nlohmann/json, zero UE dependency
 
@@ -351,7 +352,7 @@ A stdio-to-HTTP proxy that keeps Claude Code MCP sessions alive across editor re
 
 **Migrating from Python proxy:** Replace `{"command": "python", "args": ["Plugins/Monolith/Scripts/monolith_proxy.py"]}` with the config above. The Python scripts remain as deprecated fallbacks.
 
-**Source:** `Tools/MonolithProxy/monolith_proxy.cpp` (775 lines)
+**Source:** `Tools/MonolithProxy/monolith_proxy.cpp`
 
 ### monolith_query.exe — Offline Query Tool
 
